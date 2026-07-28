@@ -1,13 +1,18 @@
 "use client";
 
-import { ChatBubbleIcon, CheckIcon, DocumentsIcon, FileTextIcon, ImageIcon, PlusIcon, SparkIcon } from "./icons";
-import type { DocumentItem } from "@/lib/mock-data";
+import { CheckIcon, DocumentsIcon, FileTextIcon, ImageIcon, PlusIcon, SparkIcon } from "./icons";
+import type { DocumentSummary } from "@/lib/types";
 
-const history = [
-  "Savings account balance check",
-  "IFSC code for ICICI account",
-  "Uploaded passbook page 3",
-];
+function relativeTime(iso: string) {
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const mins = Math.round(diffMs / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  return `${days}d ago`;
+}
 
 export function Sidebar({
   documents,
@@ -15,7 +20,7 @@ export function Sidebar({
   open,
   onClose,
 }: {
-  documents: DocumentItem[];
+  documents: DocumentSummary[];
   onNewChat: () => void;
   open: boolean;
   onClose: () => void;
@@ -62,42 +67,19 @@ export function Sidebar({
                 className="flex items-center gap-2.5 rounded-lg px-2 py-2 text-sm text-ink-muted transition hover:bg-border-soft"
               >
                 <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent-strong">
-                  {doc.kind === "pdf" ? <FileTextIcon className="h-3.5 w-3.5" /> : <ImageIcon className="h-3.5 w-3.5" />}
+                  {doc.mime_type?.startsWith("image/") ? (
+                    <ImageIcon className="h-3.5 w-3.5" />
+                  ) : (
+                    <FileTextIcon className="h-3.5 w-3.5" />
+                  )}
                 </div>
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-[13px] font-medium text-ink">{doc.name}</p>
-                  <p className="truncate text-[11px] text-ink-faint">{doc.uploadedLabel}</p>
+                  <p className="truncate text-[13px] font-medium text-ink">{doc.title ?? doc.file_name}</p>
+                  <p className="truncate text-[11px] text-ink-faint">{relativeTime(doc.created_at)}</p>
                 </div>
-                {doc.status === "indexed" ? (
-                  <CheckIcon className="h-3.5 w-3.5 shrink-0 text-ink-muted" />
-                ) : (
-                  <div className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-accent" />
-                )}
+                <CheckIcon className="h-3.5 w-3.5 shrink-0 text-ink-muted" />
               </div>
             ))}
-          </div>
-
-          <p className="mt-6 px-2 text-[11px] font-semibold uppercase tracking-wider text-ink-faint">Recent</p>
-          <div className="mt-2 flex flex-col gap-0.5">
-            {history.map((item) => (
-              <button
-                key={item}
-                className="flex items-center gap-2.5 rounded-lg px-2 py-2 text-left text-[13px] text-ink-muted transition hover:bg-border-soft hover:text-ink"
-              >
-                <ChatBubbleIcon className="h-3.5 w-3.5 shrink-0 text-ink-faint" />
-                <span className="truncate">{item}</span>
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="flex items-center gap-2.5 border-t border-border px-4 py-3.5">
-          <div className="flex h-8 w-8 items-center justify-center rounded-full bg-accent-soft text-[12px] font-semibold text-accent-strong">
-            RM
-          </div>
-          <div className="min-w-0">
-            <p className="truncate text-[13px] font-medium text-ink">Rohan Mehta</p>
-            <p className="truncate text-[11px] text-ink-faint">Personal workspace</p>
           </div>
         </div>
       </aside>

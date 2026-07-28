@@ -1,7 +1,13 @@
 "use client";
 
 import { SparkIcon } from "./icons";
-import { suggestionChips } from "@/lib/mock-data";
+
+const suggestionChips = [
+  "Upload a bank statement",
+  "What's my savings account balance?",
+  "Find my IFSC code",
+  "Start a voice call",
+];
 
 export function WelcomeScreen({ onSuggestion }: { onSuggestion: (text: string) => void }) {
   return (

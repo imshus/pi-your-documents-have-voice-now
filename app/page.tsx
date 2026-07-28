@@ -1,19 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Sidebar, SidebarDocumentsBadge } from "@/components/Sidebar";
 import { WelcomeScreen } from "@/components/WelcomeScreen";
 import { MessageBubble } from "@/components/MessageBubble";
 import { ChatInput, type PendingFile } from "@/components/ChatInput";
-import { CallOverlay } from "@/components/CallOverlay";
 import { SparkIcon } from "@/components/icons";
-import {
-  generateAssistantReply,
-  seedDocuments,
-  type Attachment,
-  type ChatMessage,
-  type DocumentItem,
-} from "@/lib/mock-data";
+import type { Attachment, ChatMessage, DocumentSummary } from "@/lib/types";
 
 function formatSize(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
@@ -25,26 +19,125 @@ function uid() {
   return Math.random().toString(36).slice(2, 10);
 }
 
-export default function Home() {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [documents, setDocuments] = useState<DocumentItem[]>(seedDocuments);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [callOpen, setCallOpen] = useState(false);
+type IngestResult = {
+  file_name: string;
+  ok: boolean;
+  error?: string;
+  chunks?: number;
+  data?: {
+    title: string;
+    summary: string;
+    account: { number: string | null; ifsc_or_routing: string | null; balance: string | null };
+  };
+};
 
-  const hasDocuments = documents.some((d) => d.status === "indexed");
+export default function Home() {
+  const router = useRouter();
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [documents, setDocuments] = useState<DocumentSummary[]>([]);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  const loadDocuments = useCallback(async () => {
+    try {
+      const res = await fetch("/api/documents");
+      const json = await res.json();
+      if (!json.error) setDocuments(json.documents as DocumentSummary[]);
+    } catch {
+      // Documents panel just stays empty — not fatal to the rest of the UI.
+    }
+  }, []);
+
+  useEffect(() => {
+    loadDocuments();
+  }, [loadDocuments]);
 
   function resetChat() {
     setMessages([]);
   }
 
-  function pushAssistantReply(replyText: string) {
+  function updateMessage(id: string, patch: Partial<ChatMessage>) {
+    setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...patch } : m)));
+  }
+
+  async function ingestFiles(files: PendingFile[]) {
+    const form = new FormData();
+    files.forEach((f) => form.append("files", f.file, f.file.name));
+
     const pendingId = uid();
     setMessages((prev) => [...prev, { id: pendingId, role: "assistant", content: "", pending: true }]);
-    setTimeout(() => {
-      setMessages((prev) =>
-        prev.map((m) => (m.id === pendingId ? { ...m, content: replyText, pending: false } : m))
-      );
-    }, 700 + Math.random() * 500);
+
+    try {
+      const res = await fetch("/api/ingest", { method: "POST", body: form });
+      const json = await res.json();
+
+      if (!json.results) {
+        updateMessage(pendingId, { content: json.error ?? `Ingest failed (${res.status}).`, pending: false });
+        return;
+      }
+
+      const results = json.results as IngestResult[];
+      const lines = results.map((r) => {
+        if (!r.ok) return `**${r.file_name}**: failed — ${r.error ?? "unknown error"}`;
+        const d = r.data;
+        if (!d) return `**${r.file_name}**: processed, ${r.chunks ?? 0} chunks indexed.`;
+        const bits = [
+          d.account?.number && `account ${d.account.number}`,
+          d.account?.ifsc_or_routing && `IFSC **${d.account.ifsc_or_routing}**`,
+          d.account?.balance && `balance **${d.account.balance}**`,
+        ].filter(Boolean);
+        return `**${d.title || r.file_name}**: ${d.summary}${bits.length ? ` (${bits.join(", ")})` : ""}`;
+      });
+
+      updateMessage(pendingId, { content: lines.join("\n\n"), pending: false });
+      loadDocuments();
+    } catch (err) {
+      updateMessage(pendingId, {
+        content: err instanceof Error ? err.message : String(err),
+        pending: false,
+      });
+    }
+  }
+
+  async function sendChatMessage(text: string) {
+    const history = messages
+      .filter((m) => m.content)
+      .slice(-8)
+      .map((m) => ({ role: m.role, content: m.content }));
+
+    const pendingId = uid();
+    setMessages((prev) => [...prev, { id: pendingId, role: "assistant", content: "", pending: true }]);
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text, history, document_id: null }),
+      });
+
+      if (!res.ok || !res.body) {
+        const body = await res.json().catch(() => ({}));
+        updateMessage(pendingId, { content: body.error ?? `Chat failed (${res.status}).`, pending: false });
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let full = "";
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        full += decoder.decode(value, { stream: true });
+        updateMessage(pendingId, { content: full, pending: true });
+      }
+
+      updateMessage(pendingId, { content: full.trim() || "…", pending: false });
+    } catch (err) {
+      updateMessage(pendingId, {
+        content: err instanceof Error ? err.message : String(err),
+        pending: false,
+      });
+    }
   }
 
   function handleSend(text: string, files: PendingFile[]) {
@@ -55,63 +148,27 @@ export default function Home() {
       sizeLabel: formatSize(f.file.size),
     }));
 
-    setMessages((prev) => [
-      ...prev,
-      { id: uid(), role: "user", content: text, attachments: attachments.length ? attachments : undefined },
-    ]);
+    if (text || attachments.length) {
+      setMessages((prev) => [
+        ...prev,
+        { id: uid(), role: "user", content: text, attachments: attachments.length ? attachments : undefined },
+      ]);
+    }
 
     if (files.length > 0) {
-      const newDocs: DocumentItem[] = files.map((f, i) => ({
-        id: uid(),
-        name: f.file.name,
-        kind: f.kind,
-        status: "processing",
-        uploadedLabel: "just now",
-        holder: "Rohan Mehta",
-        accountMasked: "•••• •••• " + String(1000 + Math.floor(Math.random() * 8999)).slice(-4),
-        ifsc: "IDFB000" + (1000 + i),
-        balance: "₹" + (10000 + Math.floor(Math.random() * 190000)).toLocaleString("en-IN") + ".00",
-      }));
-      setDocuments((prev) => [...newDocs, ...prev]);
-
-      const pendingId = uid();
-      setMessages((prev) => [...prev, { id: pendingId, role: "assistant", content: "", pending: true }]);
-
-      setTimeout(() => {
-        setDocuments((prev) =>
-          prev.map((d) => (newDocs.some((nd) => nd.id === d.id) ? { ...d, status: "indexed" } : d))
-        );
-        const first = newDocs[0];
-        const summary =
-          `Processed **${first.name}**. Found account holder **${first.holder}**, ` +
-          `account ${first.accountMasked}, IFSC **${first.ifsc}**, balance **${first.balance}**. ` +
-          `Ask me anything about it.`;
-        setMessages((prev) =>
-          prev.map((m) => (m.id === pendingId ? { ...m, content: summary, pending: false } : m))
-        );
-      }, 1400);
+      ingestFiles(files);
       return;
     }
 
-    if (text) {
-      pushAssistantReply(generateAssistantReply(text, hasDocuments));
-    }
+    if (text) sendChatMessage(text);
   }
 
   function handleSuggestion(text: string) {
     if (text.toLowerCase().includes("voice call")) {
-      setCallOpen(true);
+      router.push("/call");
       return;
     }
     handleSend(text, []);
-  }
-
-  function handleCallEnd(durationLabel: string, topic: string) {
-    setCallOpen(false);
-    setMessages((prev) => [
-      ...prev,
-      { id: uid(), role: "assistant", content: "", callSummary: { durationLabel, topic } },
-    ]);
   }
 
   return (
@@ -130,7 +187,7 @@ export default function Home() {
           <p className="hidden text-[13px] font-medium text-ink-muted md:block">
             {messages.length === 0 ? "New conversation" : "Conversation"}
           </p>
-          <SidebarDocumentsBadge count={documents.filter((d) => d.status === "indexed").length} />
+          <SidebarDocumentsBadge count={documents.length} />
         </header>
 
         {messages.length === 0 ? (
@@ -145,10 +202,8 @@ export default function Home() {
           </div>
         )}
 
-        <ChatInput onSend={handleSend} onStartCall={() => setCallOpen(true)} />
+        <ChatInput onSend={handleSend} onStartCall={() => router.push("/call")} />
       </div>
-
-      {callOpen && <CallOverlay onEnd={handleCallEnd} />}
     </div>
   );
 }

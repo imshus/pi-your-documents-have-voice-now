@@ -1,7 +1,7 @@
 "use client";
 
-import { FileTextIcon, ImageIcon, PhoneIcon, SparkIcon } from "./icons";
-import type { ChatMessage } from "@/lib/mock-data";
+import { FileTextIcon, ImageIcon, SparkIcon } from "./icons";
+import type { ChatMessage } from "@/lib/types";
 
 function renderContent(content: string) {
   const parts = content.split(/\*\*(.*?)\*\*/g);
@@ -18,19 +18,7 @@ function renderContent(content: string) {
 
 export function MessageBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
-
-  if (message.callSummary) {
-    return (
-      <div className="animate-fade-up flex justify-center py-1">
-        <div className="flex items-center gap-2.5 rounded-full border border-border bg-surface px-4 py-2 text-[13px] text-ink-muted shadow-soft">
-          <span className="flex h-6 w-6 items-center justify-center rounded-full bg-accent-soft text-ink">
-            <PhoneIcon className="h-3 w-3" />
-          </span>
-          Call ended · {message.callSummary.durationLabel} · {message.callSummary.topic}
-        </div>
-      </div>
-    );
-  }
+  const showTyping = message.pending && !message.content;
 
   return (
     <div className={`animate-fade-up flex gap-3 ${isUser ? "flex-row-reverse" : ""}`}>
@@ -58,15 +46,15 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
             ))}
           </div>
         )}
-        {message.content && (
+        {(message.content || showTyping) && (
           <div
-            className={`rounded-2xl px-4 py-2.5 text-[14.5px] leading-relaxed ${
+            className={`rounded-2xl px-4 py-2.5 text-[14.5px] leading-relaxed whitespace-pre-wrap ${
               isUser
                 ? "rounded-tr-sm bg-accent text-canvas"
                 : "rounded-tl-sm border border-border bg-surface text-ink shadow-soft"
             }`}
           >
-            {message.pending ? (
+            {showTyping ? (
               <span className="flex items-center gap-1 py-0.5">
                 <span className="animate-dot h-1.5 w-1.5 rounded-full bg-current" style={{ animationDelay: "0ms" }} />
                 <span className="animate-dot h-1.5 w-1.5 rounded-full bg-current" style={{ animationDelay: "150ms" }} />
