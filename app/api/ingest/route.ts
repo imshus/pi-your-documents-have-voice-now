@@ -3,6 +3,7 @@ import { extractDocument } from "@/lib/extract";
 import { chunkDocument } from "@/lib/chunk";
 import { embed } from "@/lib/openai";
 import { supabaseAdmin, DOCUMENTS_BUCKET } from "@/lib/supabase";
+import { TEXT_CONVERTIBLE, extractTextFromFile, resolveMimeType } from "@/lib/parseDocument";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -31,7 +32,7 @@ function coverageAudit(data: Record<string, unknown>): string | null {
     .join(", ")}${missing.length > 10 ? ", …" : ""}`;
 }
 
-const ACCEPTED = new Set([
+const VISION_ACCEPTED = new Set([
   "application/pdf",
   "image/png",
   "image/jpeg",
@@ -39,6 +40,8 @@ const ACCEPTED = new Set([
   "image/webp",
   "image/gif",
 ]);
+
+const ACCEPTED = new Set([...VISION_ACCEPTED, ...TEXT_CONVERTIBLE]);
 
 /**
  * Step 2 + 3 of the pipeline:
@@ -72,24 +75,32 @@ export async function POST(req: NextRequest) {
 
   for (const file of files) {
     try {
-      const mimeType = file.type || "application/octet-stream";
+      const mimeType = resolveMimeType(file.type, file.name);
       if (!ACCEPTED.has(mimeType)) {
         results.push({
           file_name: file.name,
           ok: false,
-          error: `Unsupported type ${mimeType}. Upload a PDF or an image.`,
+          error: `Unsupported type ${mimeType || "unknown"}. Upload a PDF, image, spreadsheet, or document.`,
         });
         continue;
       }
 
       const bytes = Buffer.from(await file.arrayBuffer());
 
-      // --- read the document ------------------------------------------------
-      const data = await extractDocument({
-        fileName: file.name,
-        mimeType,
-        base64: bytes.toString("base64"),
-      });
+      // --- read the document --------------------------------------------------
+      // Spreadsheets/docx/csv/txt are converted to plain text first; PDFs and
+      // images go straight through vision. Same extraction schema either way.
+      const data = TEXT_CONVERTIBLE.has(mimeType)
+        ? await extractDocument({
+            fileName: file.name,
+            mimeType,
+            text: await extractTextFromFile(bytes, mimeType),
+          })
+        : await extractDocument({
+            fileName: file.name,
+            mimeType,
+            base64: bytes.toString("base64"),
+          });
 
       // --- keep the original alongside the JSON (best-effort) ---------------
       const storagePath = `${Date.now()}-${file.name.replace(/[^\w.\-]+/g, "_")}`;

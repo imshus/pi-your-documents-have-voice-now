@@ -181,28 +181,37 @@ Completeness contract — capture EVERYTHING on the page:
 - Printed terms, conditions, declarations, and notes go verbatim in remarks.
 - A detail that fits no other field still goes in fields. full_text must contain every readable character on the page.`;
 
-export type SupportedInput = {
-  fileName: string;
-  mimeType: string;
-  /** Raw file bytes as base64 (no data: prefix). */
-  base64: string;
-};
+export type SupportedInput =
+  | {
+      fileName: string;
+      mimeType: string;
+      /** Raw file bytes as base64 (no data: prefix). */
+      base64: string;
+    }
+  | {
+      fileName: string;
+      mimeType: string;
+      /** Already-converted plain text (spreadsheets, docx, csv, txt). */
+      text: string;
+    };
 
 /**
- * Sends one file to the OpenAI vision model and returns the structured
- * payload. PDFs go through as input_file; images as input_image.
+ * Sends one file to the OpenAI model and returns the structured payload.
+ * PDFs go through as input_file, images as input_image — both via vision.
+ * Spreadsheets/docx/csv/txt are pre-converted to plain text upstream and go
+ * through as input_text instead; same schema either way.
  */
 export async function extractDocument(
   input: SupportedInput
 ): Promise<ExtractedDocument> {
-  const dataUrl = `data:${input.mimeType};base64,${input.base64}`;
-
   const filePart =
-    input.mimeType === "application/pdf"
-      ? { type: "input_file", filename: input.fileName, file_data: dataUrl }
-      : // "original" skips downsampling — on gpt-5.5/5.6 "auto" already behaves
-        // like this, but pinning it keeps 5.4-tier models honest if swapped in.
-        { type: "input_image", image_url: dataUrl, detail: "original" };
+    "text" in input
+      ? { type: "input_text" as const, text: input.text }
+      : input.mimeType === "application/pdf"
+        ? { type: "input_file" as const, filename: input.fileName, file_data: `data:${input.mimeType};base64,${input.base64}` }
+        : // "original" skips downsampling — on gpt-5.5/5.6 "auto" already behaves
+          // like this, but pinning it keeps 5.4-tier models honest if swapped in.
+          { type: "input_image" as const, image_url: `data:${input.mimeType};base64,${input.base64}`, detail: "original" as const };
 
   const res = await openaiFetch("/responses", {
     method: "POST",
