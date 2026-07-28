@@ -5,7 +5,7 @@ import { FileTextIcon, ImageIcon, MicIcon, PhoneIcon, PlusIcon, SendIcon, XIcon 
 
 export interface PendingFile {
   file: File;
-  kind: "pdf" | "image";
+  kind: "pdf" | "image" | "file";
 }
 
 export function ChatInput({
@@ -39,11 +39,17 @@ export function ChatInput({
     return () => document.removeEventListener("mousedown", handleClick);
   }, []);
 
+  function classify(file: File): PendingFile["kind"] {
+    if (file.type === "application/pdf") return "pdf";
+    if (file.type.startsWith("image/")) return "image";
+    return "file";
+  }
+
   function handleFiles(fileList: FileList | null) {
     if (!fileList || fileList.length === 0) return;
     const files = Array.from(fileList).map((file) => ({
       file,
-      kind: (file.type === "application/pdf" ? "pdf" : "image") as "pdf" | "image",
+      kind: classify(file),
     }));
     setPendingFiles((prev) => [...prev, ...files]);
     setMenuOpen(false);
@@ -67,7 +73,7 @@ export function ChatInput({
       <input
         ref={fileInputRef}
         type="file"
-        accept="application/pdf,image/*"
+        accept="application/pdf,image/*,.csv,.xls,.xlsx,.doc,.docx,.txt,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/csv,text/plain"
         multiple
         className="hidden"
         onChange={(e) => handleFiles(e.target.files)}
@@ -90,7 +96,7 @@ export function ChatInput({
                 className="flex items-center gap-2 rounded-lg border border-border bg-canvas px-2.5 py-1.5"
               >
                 <div className="flex h-6 w-6 items-center justify-center rounded-md bg-accent-soft text-accent-strong">
-                  {pf.kind === "pdf" ? <FileTextIcon className="h-3.5 w-3.5" /> : <ImageIcon className="h-3.5 w-3.5" />}
+                  {pf.kind === "image" ? <ImageIcon className="h-3.5 w-3.5" /> : <FileTextIcon className="h-3.5 w-3.5" />}
                 </div>
                 <span className="max-w-[140px] truncate text-[12.5px] font-medium text-ink">{pf.file.name}</span>
                 <button

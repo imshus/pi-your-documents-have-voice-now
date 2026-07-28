@@ -8,7 +8,7 @@ export type DocumentSummary = {
   summary: string | null;
 };
 
-export type AttachmentKind = "pdf" | "image";
+export type AttachmentKind = "pdf" | "image" | "file";
 
 export type Attachment = {
   id: string;

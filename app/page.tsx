@@ -163,14 +163,6 @@ export default function Home() {
     if (text) sendChatMessage(text);
   }
 
-  function handleSuggestion(text: string) {
-    if (text.toLowerCase().includes("voice call")) {
-      router.push("/call");
-      return;
-    }
-    handleSend(text, []);
-  }
-
   return (
     <div className="flex h-dvh overflow-hidden bg-canvas">
       <Sidebar documents={documents} onNewChat={resetChat} open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
@@ -191,7 +183,7 @@ export default function Home() {
         </header>
 
         {messages.length === 0 ? (
-          <WelcomeScreen onSuggestion={handleSuggestion} />
+          <WelcomeScreen />
         ) : (
           <div className="flex-1 overflow-y-auto">
             <div className="mx-auto flex max-w-3xl flex-col gap-5 px-4 py-6 md:px-0">

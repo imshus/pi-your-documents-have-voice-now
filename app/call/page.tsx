@@ -614,30 +614,33 @@ export default function CallPage() {
 
   return (
     <div className="space-y-7">
+      <Link href="/" className="inline-flex items-center gap-1.5 text-[13px] text-ink-muted transition hover:text-ink">
+        ← Back to chat
+      </Link>
+
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Call the account desk</h1>
-        <p className="mt-1 text-sm text-neutral-400">
-          Deepgram listens, the answer is retrieved from your indexed documents, Sarvam
-          speaks it back. Interrupt any time.
+        <h1 className="text-2xl font-semibold tracking-tight text-ink">Talk to Pi</h1>
+        <p className="mt-1 text-sm text-ink-muted">
+          Pi listens, retrieves the answer from your documents, and speaks it back. Interrupt any time.
         </p>
       </div>
 
       {docs.length === 0 ? (
-        <p className="rounded-xl border border-neutral-800 bg-neutral-900/40 p-6 text-sm text-neutral-400">
-          No documents indexed yet — the agent would have nothing to read.{" "}
-          <Link href="/" className="text-emerald-400 hover:underline">
+        <p className="rounded-xl border border-border bg-surface p-6 text-sm text-ink-muted shadow-soft">
+          No documents indexed yet — Pi would have nothing to read.{" "}
+          <Link href="/" className="text-ink underline underline-offset-2 hover:no-underline">
             Upload one first
           </Link>
           .
         </p>
       ) : (
         <label className="block max-w-md text-sm">
-          <span className="text-neutral-400">Scope of the call</span>
+          <span className="text-ink-muted">Scope of the call</span>
           <select
             value={scope}
             onChange={(e) => setScope(e.target.value)}
             disabled={live || connecting}
-            className="mt-1.5 w-full rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2 text-neutral-100 disabled:opacity-50"
+            className="mt-1.5 w-full rounded-lg border border-border bg-surface px-3 py-2 text-ink shadow-soft disabled:opacity-50"
           >
             <option value="all">All documents ({docs.length})</option>
             {docs.map((d) => (
@@ -649,18 +652,18 @@ export default function CallPage() {
         </label>
       )}
 
-      <div className="flex flex-col items-center gap-4 rounded-2xl border border-neutral-800 bg-neutral-900/40 py-10">
+      <div className="flex flex-col items-center gap-4 rounded-2xl border border-border bg-surface py-10 shadow-soft">
         <div className="relative">
           {(live || speaking) && (
-            <span className="pulse-ring absolute inset-0 rounded-full border-2 border-emerald-500" />
+            <span className="animate-pulse-ring absolute inset-0 rounded-full border-2 border-accent" />
           )}
           <button
             onClick={live || connecting ? () => hangUp() : startCall}
             disabled={docs.length === 0 && !live}
-            className={`relative flex h-24 w-24 items-center justify-center rounded-full text-neutral-950 transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 ${
+            className={`relative flex h-24 w-24 items-center justify-center rounded-full transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 ${
               live || connecting
-                ? "bg-red-500 hover:bg-red-400"
-                : "bg-emerald-500 hover:bg-emerald-400"
+                ? "bg-red-500 text-white hover:bg-red-600"
+                : "bg-accent text-canvas hover:bg-accent-strong"
             }`}
             aria-label={live || connecting ? "End call" : "Start call"}
           >
@@ -674,7 +677,7 @@ export default function CallPage() {
           </button>
         </div>
 
-        <p className="text-sm text-neutral-400">
+        <p className="text-sm text-ink-muted">
           {status === "idle" && "Tap to call"}
           {connecting && "Connecting…"}
           {live && (thinking ? "Looking it up…" : speaking ? "Speaking…" : "Listening")}
@@ -685,7 +688,7 @@ export default function CallPage() {
         {live && (
           <button
             onClick={toggleMute}
-            className="rounded-full border border-neutral-700 px-4 py-1.5 text-xs text-neutral-300 hover:border-neutral-500"
+            className="rounded-full border border-border px-4 py-1.5 text-xs text-ink-muted transition hover:border-ink-faint hover:text-ink"
           >
             {muted ? "Unmute" : "Mute"}
           </button>
@@ -693,7 +696,7 @@ export default function CallPage() {
       </div>
 
       {error && (
-        <p className="rounded-lg border border-red-900 bg-red-950/40 p-3 text-sm text-red-300">
+        <p className="rounded-lg border border-red-900/60 bg-red-950/10 p-3 text-sm text-red-500">
           {error}
         </p>
       )}
@@ -701,28 +704,28 @@ export default function CallPage() {
       {(log.length > 0 || partial) && (
         <div
           ref={logBoxRef}
-          className="max-h-96 space-y-2 overflow-y-auto rounded-xl border border-neutral-800 bg-neutral-900/40 p-4"
+          className="max-h-96 space-y-2 overflow-y-auto rounded-xl border border-border bg-surface p-4 shadow-soft"
         >
           {log.map((l, i) => (
             <p
               key={i}
               className={
                 l.kind === "caller"
-                  ? "text-sm text-neutral-100"
+                  ? "text-sm text-ink"
                   : l.kind === "agent"
-                    ? "text-sm text-emerald-300"
-                    : "text-xs text-neutral-500"
+                    ? "text-sm font-medium text-ink"
+                    : "text-xs text-ink-faint"
               }
             >
               {l.kind !== "note" && (
-                <span className="mr-2 text-xs uppercase tracking-wide text-neutral-500">
+                <span className="mr-2 text-xs uppercase tracking-wide text-ink-faint">
                   {l.kind}
                 </span>
               )}
               {l.text}
             </p>
           ))}
-          {partial && <p className="text-sm italic text-neutral-500">{partial}</p>}
+          {partial && <p className="text-sm italic text-ink-faint">{partial}</p>}
         </div>
       )}
     </div>

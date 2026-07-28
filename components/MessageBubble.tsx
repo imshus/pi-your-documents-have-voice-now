@@ -36,7 +36,7 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
                 className="flex items-center gap-2 rounded-xl border border-border bg-surface px-3 py-2 shadow-soft"
               >
                 <div className="flex h-7 w-7 items-center justify-center rounded-md bg-accent-soft text-accent-strong">
-                  {att.kind === "pdf" ? <FileTextIcon className="h-3.5 w-3.5" /> : <ImageIcon className="h-3.5 w-3.5" />}
+                  {att.kind === "image" ? <ImageIcon className="h-3.5 w-3.5" /> : <FileTextIcon className="h-3.5 w-3.5" />}
                 </div>
                 <div className="leading-tight">
                   <p className="max-w-[160px] truncate text-[12.5px] font-medium text-ink">{att.name}</p>
