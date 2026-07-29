@@ -1,5 +1,5 @@
-// Runs the real retrieve -> answer pipeline against the indexed data, comparing
-// the configured chat model with the intended one. Read-only. No secrets printed.
+// Runs the real retrieve -> answer pipeline against the indexed data using the
+// configured DeepSeek answering model. Read-only. No secrets printed.
 import { readFileSync } from "node:fs";
 import { createClient } from "@supabase/supabase-js";
 
@@ -17,7 +17,8 @@ function loadEnv() {
   return env;
 }
 const env = loadEnv();
-const BASE = env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
+const BASE = env.OPENAI_BASE_URL ?? "https://api.openai.com/v1"; // embeddings only
+const DS_BASE = env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com"; // answering model
 const sb = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
 async function embed(text) {
@@ -45,30 +46,21 @@ const PERSONA = `You are an account desk voice assistant. Answer ONLY from the C
 Read the exact value word-for-word from the context; never guess. Answer the specific thing asked, one short spoken sentence.
 Match the caller's language (Hinglish gets a Hinglish reply with Hindi words in Devanagari). Write numbers as digits.`;
 
+// Answering runs on DeepSeek (OpenAI-compatible endpoint, no 5.6-only params).
 async function answer(model, query, context) {
   const body = {
-    model, stream: false, reasoning_effort: "none", verbosity: "low",
+    model, stream: false, temperature: Number(env.DEEPSEEK_TEMPERATURE ?? 0.3), max_tokens: 200,
     messages: [
       { role: "system", content: PERSONA },
       { role: "user", content: `${query}\n\nCONTEXT:\n${context}` },
     ],
   };
-  let r = await fetch(`${BASE}/chat/completions`, {
+  const r = await fetch(`${DS_BASE}/chat/completions`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Bearer ${env.DEEPSEEK_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!r.ok) {
-    // Retry without the 5.6-only params in case this model rejects them.
-    const t = await r.text();
-    delete body.reasoning_effort; delete body.verbosity;
-    r = await fetch(`${BASE}/chat/completions`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) return `<ERROR ${r.status}: ${(await r.text()).slice(0, 160)} | first: ${t.slice(0, 120)}>`;
-  }
+  if (!r.ok) return `<ERROR ${r.status}: ${(await r.text()).slice(0, 200)}>`;
   const j = await r.json();
   return j.choices?.[0]?.message?.content ?? "<no content>";
 }
@@ -82,7 +74,7 @@ const QUESTIONS = [
   { q: "aathvi item ka amount kitna hai?", expect: "34142" },
   { q: "item 2 ka amount?", expect: "15570" },
 ];
-const MODELS = [env.OPENAI_CHAT_MODEL ?? "gpt-5.4-nano", "gpt-5.6-luna"];
+const MODELS = [env.DEEPSEEK_CHAT_MODEL ?? "deepseek-chat"];
 
 for (const { q, expect } of QUESTIONS) {
   const hits = await retrieve(q);

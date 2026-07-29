@@ -31,16 +31,28 @@ export const VISION_MODEL = process.env.OPENAI_VISION_MODEL ?? "gpt-5.5";
  * while fitting the same vector(1536) column. Changing this requires
  * re-embedding every chunk — small and large vectors are not comparable.
  */
-export const EMBEDDING_MODEL =
-  process.env.OPENAI_EMBEDDING_MODEL ?? "text-embedding-3-large";
+/**
+ * NO default. Query vectors must come from the SAME model the corpus was
+ * embedded with — a silent fallback to a different model returns plausible but
+ * wrong chunks with no error anywhere, which is the worst failure this app has.
+ */
+export const EMBEDDING_MODEL = (() => {
+  const model = process.env.OPENAI_EMBEDDING_MODEL;
+  if (!model) {
+    throw new Error(
+      "Missing OPENAI_EMBEDDING_MODEL. It must match the model the corpus was embedded with — changing it requires re-embedding every chunk."
+    );
+  }
+  return model;
+})();
 export const EMBEDDING_DIMS = 1536;
 /**
- * Answering model in the voice pipeline. gpt-5.6-luna at reasoning effort
- * "none": ~0.75s TTFT, fastest output in class, and clearly smarter than the
- * 5.4 minis at the same effort. Effort MUST be pinned to "none" in the call —
+ * OpenAI answering model — used only when CHAT_PROVIDER=openai (the default is
+ * DeepSeek; see lib/deepseek.ts and lib/chat.ts). gpt-5.6-luna at reasoning
+ * effort "none": ~0.75s TTFT. Effort MUST be pinned to "none" in the call —
  * 5.6 models silently default to "medium", which adds ~1.3s of TTFT.
  */
-export const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL ?? "gpt-5.6-luna";
+export const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL ?? "gpt-5.6-luna";
 
 function apiKey(): string {
   const key = process.env.OPENAI_API_KEY;

@@ -1,7 +1,11 @@
 import { NextRequest } from "next/server";
-import { openaiFetch, CHAT_MODEL } from "@/lib/openai";
+import { chatBackend, ChatUsage } from "@/lib/chat";
+import { askLanguage, replyDirective } from "@/lib/askLanguage";
+import { CORPUS_MODE, buildCorpus } from "@/lib/corpus";
+import { systemWithCorpus } from "@/lib/corpusFormat";
+import { targetRow } from "@/lib/queryText";
 import { retrieve, RetrievalHit } from "@/lib/retrieval";
-import { PERSONA, PROMPT_CACHE_KEY } from "@/lib/persona";
+import { PERSONA } from "@/lib/persona";
 
 /**
  * Client-side priming runs retrieval on the caller's PARTIAL transcript while
@@ -23,13 +27,23 @@ function prefetchUsable(finalMessage: string, primedFor: string): boolean {
 export const runtime = "nodejs";
 export const maxDuration = 120;
 
+/** Retrieved chunks, numbered for the model. */
+function formatChunks(chunks: RetrievalHit[]): string {
+  return chunks.length
+    ? chunks
+        .map((c, i) => `[${i + 1}] (${c.doc_type ?? "document"} — ${c.section})\n${c.content}`)
+        .join("\n\n")
+    : "(nothing relevant found in the caller's documents)";
+}
+
 type Turn = { role: "user" | "assistant"; content: string };
 
 /**
  * The middle of the voice pipeline: retrieve, then generate.
- * Retrieval runs on every turn (no tool round-trip); the model runs at
- * reasoning effort "none" — on 5.6-family models omitting the parameter
- * silently defaults to "medium" and costs ~1.3s of time-to-first-token.
+ * Retrieval runs on every turn (no tool round-trip); generation streams so the
+ * client can start speaking the first sentence before the answer finishes. The
+ * answering model is chosen by CHAT_PROVIDER (DeepSeek default | OpenAI) — see
+ * lib/chat.ts; both cache the stable [system + history] prefix.
  */
 export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as {
@@ -46,7 +60,17 @@ export async function POST(req: NextRequest) {
 
   try {
     // ---- retrieve ---------------------------------------------------------
-    const history = (body.history ?? []).slice(-8);
+    // Client-supplied — validate the roles. Spreading this unchecked let a
+    // crafted request inject a `system` turn and override the grounding rules.
+    const history = (body.history ?? [])
+      .filter(
+        (t): t is Turn =>
+          !!t &&
+          (t.role === "user" || t.role === "assistant") &&
+          typeof t.content === "string"
+      )
+      .map((t) => ({ role: t.role, content: t.content.slice(0, 2000) }))
+      .slice(-8);
 
     // Fold in the previous turn so follow-ups like "aur branch?" still
     // retrieve against the right document.
@@ -55,8 +79,27 @@ export async function POST(req: NextRequest) {
 
     const tRetrieve = Date.now();
     let retrievalSource = "live";
-    let chunks: RetrievalHit[];
-    if (
+    let chunks: RetrievalHit[] = [];
+    let context: string;
+    // The corpus block, when full mode is on AND the corpus is small enough.
+    // It goes in the SYSTEM message so [PERSONA + corpus] is one byte-stable
+    // prefix that caches on every turn of every call.
+    let corpusBlock: string | null = null;
+
+    if (CORPUS_MODE === "full") {
+      const corpus = await buildCorpus(body.document_id ?? null);
+      if (corpus) {
+        corpusBlock = corpus.text;
+        retrievalSource = "corpus";
+        // No per-turn context: the documents are already in the prefix, and
+        // repeating them here would put a copy in the volatile tail too.
+        context = "";
+      } else {
+        // Too large to inline, or nothing indexed — fall back to retrieval.
+        chunks = await retrieve(searchText, body.document_id ?? null, 8);
+        context = formatChunks(chunks);
+      }
+    } else if (
       body.prefetched &&
       body.prefetched.results.length > 0 &&
       prefetchUsable(message, body.prefetched.for)
@@ -64,41 +107,58 @@ export async function POST(req: NextRequest) {
       // Primed during the caller's speech — the whole retrieval leg is free.
       chunks = body.prefetched.results;
       retrievalSource = "prefetched";
+      context = formatChunks(chunks);
     } else {
-      // Stale-scope fallback happens inside retrieve() reusing the embedding.
       chunks = await retrieve(searchText, body.document_id ?? null, 8);
+      context = formatChunks(chunks);
     }
-
-    const context = chunks.length
-      ? chunks
-          .map((c, i) => `[${i + 1}] (${c.doc_type ?? "document"} — ${c.section})\n${c.content}`)
-          .join("\n\n")
-      : "(nothing relevant found in the caller's documents)";
 
     const retrieveMs = Date.now() - tRetrieve;
 
+    // Table chunks carry 8 rows each, so "the 8th item" arrives as a block of
+    // items 1-8 and the model was picking a neighbouring row's amount —
+    // confidently, and only on some phrasings. The row is deterministic from the
+    // question, so state it rather than letting the model locate it.
+    const row = targetRow(message);
+    const rowDirective = row
+      ? `ROW: the caller is asking about item ${row}. Read the value from the line for item ${row} only — the context contains several item rows and the neighbouring ones are NOT the answer. If no line for item ${row} appears in the context, say it is not in the documents rather than answering from another row.\n\n`
+      : "";
+
     // ---- generate ---------------------------------------------------------
     const tLlm = Date.now();
-    const upstream = await openaiFetch("/chat/completions", {
+    const backend = chatBackend();
+    const upstream = await backend.fetch("/chat/completions", {
       method: "POST",
       body: JSON.stringify({
-        model: CHAT_MODEL,
+        model: backend.model,
         stream: true,
-        // Pinned: 5.6 models default to "medium" reasoning when omitted.
-        reasoning_effort: "none",
+        // Provider-specific tuning (reasoning/verbosity/cache-key vs temperature).
+        ...backend.tuning,
         // Short spoken answers; parameter-level backstop for the prompt rule.
-        verbosity: "low",
-        // 5.6+ caching needs an explicit key for reliable prefix matching.
-        prompt_cache_key: PROMPT_CACHE_KEY,
+        [backend.capField]: 200,
         // Final usage frame so we can log how much of the input prefix
         // (PERSONA + history) was served from cache vs billed fresh.
         stream_options: { include_usage: true },
         messages: [
-          { role: "system", content: PERSONA },
+          {
+            role: "system",
+            // In full mode the corpus is appended HERE, making [PERSONA +
+            // corpus] one byte-stable prefix that caches on every turn of every
+            // call. In hybrid mode this is PERSONA alone and the per-turn
+            // context rides in the volatile tail below.
+            content: corpusBlock
+              ? systemWithCorpus(PERSONA, corpusBlock)
+              : PERSONA,
+          },
           ...history,
           {
             role: "user",
-            content: `${message}\n\nCONTEXT (retrieved from the caller's documents):\n${context}`,
+            // Directives go LAST, after the context: closest to the answer is
+            // where they hold best, and keeping them out of the system prompt
+            // leaves [system + history] a byte-stable cacheable prefix.
+            content: corpusBlock
+              ? `${message}\n\n${rowDirective}${replyDirective(askLanguage(message))}`
+              : `${message}\n\nCONTEXT (retrieved from the caller's documents):\n${context}\n\n${rowDirective}${replyDirective(askLanguage(message))}`,
           },
         ],
       }),
@@ -113,9 +173,8 @@ export async function POST(req: NextRequest) {
         const encoder = new TextEncoder();
         let buffer = "";
         let ttft: number | null = null;
-        let usage:
-          | { prompt_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } }
-          | null = null;
+        let usage: ChatUsage | null = null;
+        let errored = false;
 
         try {
           for (;;) {
@@ -131,8 +190,24 @@ export async function POST(req: NextRequest) {
               const payload = line.slice(5).trim();
               if (!payload || payload === "[DONE]") continue;
 
+              let json: {
+                usage?: ChatUsage;
+                error?: { message?: string };
+                choices?: { delta?: { content?: string } }[];
+              };
               try {
-                const json = JSON.parse(payload);
+                json = JSON.parse(payload);
+              } catch {
+                // Partial JSON across chunk boundaries — skip it.
+                continue;
+              }
+              {
+                // A provider error frame arrives as a normal SSE line. Dropping
+                // it silently truncated the answer and the caller heard a
+                // half-value spoken as fact.
+                if (json.error) {
+                  throw new Error(json.error.message ?? "upstream error");
+                }
                 if (json.usage) usage = json.usage;
                 const delta = json.choices?.[0]?.delta?.content;
                 if (delta) {
@@ -146,22 +221,31 @@ export async function POST(req: NextRequest) {
                   }
                   controller.enqueue(encoder.encode(delta));
                 }
-              } catch {
-                // Partial JSON across chunk boundaries — skip it.
               }
             }
           }
+        } catch (err) {
+          // Must ERROR the stream, not close it: closing looks identical to a
+          // finished answer, so the client spoke a truncated value and wrote it
+          // into history as fact.
+          errored = true;
+          console.error("[chat] stream aborted:", err);
+          controller.error(err);
         } finally {
           if (usage) {
-            const cached = usage.prompt_tokens_details?.cached_tokens ?? 0;
-            const prompt = usage.prompt_tokens ?? 0;
+            const { cached, prompt } = backend.usage(usage);
             const pct = prompt ? Math.round((cached / prompt) * 100) : 0;
             // Cached input = the stable PERSONA + history prefix reused each
             // turn; only the fresh retrieval + new user message is billed full.
             console.log(`[chat] input=${prompt}tok cached=${cached}tok (${pct}%)`);
           }
-          controller.close();
+          if (!errored) controller.close();
         }
+      },
+      // Client hung up or barged in — stop the upstream generation instead of
+      // paying for tokens nobody will hear.
+      async cancel(reason) {
+        await upstream.body!.cancel(reason).catch(() => {});
       },
     });
 

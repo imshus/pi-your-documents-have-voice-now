@@ -99,12 +99,17 @@ export function chunkDocument(doc: ExtractedDocument, fileName: string): Chunk[]
   }
 
   if (doc.parties.length) {
-    chunks.push({
-      section: "parties",
-      content: `${header}\nPeople and companies on this document:\n${doc.parties
-        .map((p) => `${p.role}: ${p.name}${p.details ? ` — ${p.details}` : ""}`)
-        .join("\n")}`,
-    });
+    // splitLongText, not a bare push: a document with many parties produced one
+    // oversized chunk whose embedding was too diluted to retrieve. (It returns
+    // the single chunk unchanged when the text is already under budget.)
+    chunks.push(
+      ...splitLongText(
+        "parties",
+        `${header}\nPeople and companies on this document:\n${doc.parties
+          .map((p) => `${p.role}: ${p.name}${p.details ? ` — ${p.details}` : ""}`)
+          .join("\n")}`
+      )
+    );
   }
 
   const notes = [
@@ -112,10 +117,12 @@ export function chunkDocument(doc: ExtractedDocument, fileName: string): Chunk[]
     ...doc.stamps_and_annotations.map((s) => `Stamp/annotation: ${s}`),
   ];
   if (notes.length) {
-    chunks.push({
-      section: "notes",
-      content: `${header}\nRemarks, stamps and annotations:\n${notes.join("\n")}`,
-    });
+    chunks.push(
+      ...splitLongText(
+        "notes",
+        `${header}\nRemarks, stamps and annotations:\n${notes.join("\n")}`
+      )
+    );
   }
 
   const misc = [
@@ -125,12 +132,12 @@ export function chunkDocument(doc: ExtractedDocument, fileName: string): Chunk[]
   ];
   // 12 label/value pairs per chunk keeps each vector topically tight.
   for (let i = 0; i < misc.length; i += 12) {
-    chunks.push({
-      section: "fields",
-      content: `${header}\nDetails from the document:\n${misc
-        .slice(i, i + 12)
-        .join("\n")}`,
-    });
+    chunks.push(
+      ...splitLongText(
+        "fields",
+        `${header}\nDetails from the document:\n${misc.slice(i, i + 12).join("\n")}`
+      )
+    );
   }
 
   for (const table of doc.tables) {
@@ -143,10 +150,12 @@ export function chunkDocument(doc: ExtractedDocument, fileName: string): Chunk[]
         .slice(i, i + 8)
         .map((r) => r.join(" | "))
         .join("\n");
-      chunks.push({
-        section: `table:${table.name}`,
-        content: `${head}\nRows ${i + 1}-${i + Math.min(8, table.rows.length - i)}:\n${rows}`,
-      });
+      chunks.push(
+        ...splitLongText(
+          `table:${table.name}`,
+          `${head}\nRows ${i + 1}-${i + Math.min(8, table.rows.length - i)}:\n${rows}`
+        )
+      );
     }
   }
 

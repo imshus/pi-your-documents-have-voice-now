@@ -130,6 +130,7 @@ export default function Home() {
         full += decoder.decode(value, { stream: true });
         updateMessage(pendingId, { content: full, pending: true });
       }
+      full += decoder.decode(); // flush any buffered multi-byte tail
 
       updateMessage(pendingId, { content: full.trim() || "…", pending: false });
     } catch (err) {
@@ -155,12 +156,13 @@ export default function Home() {
       ]);
     }
 
-    if (files.length > 0) {
-      ingestFiles(files);
-      return;
-    }
-
-    if (text) sendChatMessage(text);
+    // Sequence, don't drop: sending a file WITH a question used to `return`
+    // after ingest and silently discard the question. Awaiting also means
+    // retrieval sees the freshly indexed chunks.
+    void (async () => {
+      if (files.length > 0) await ingestFiles(files);
+      if (text) await sendChatMessage(text);
+    })();
   }
 
   return (

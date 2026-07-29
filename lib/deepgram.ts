@@ -11,7 +11,27 @@
  * short-lived token — the real API key never leaves this process.
  */
 
-const DEEPGRAM_API = "https://api.deepgram.com";
+/**
+ * Deepgram host. The default `api.deepgram.com` is NORTH AMERICA, and it is by
+ * far the worst leg in this pipeline from India — measured TCP RTT from Delhi:
+ *
+ *     api.deepgram.com      249ms   (38.104.135.212, US)
+ *     api.eu.deepgram.com   194ms   (Frankfurt)
+ *     api.au.deepgram.com   174ms   (Sydney)
+ *
+ * Every other upstream is 6-44ms. The socket is persistent, so this RTT is not
+ * a one-off handshake: the caller's audio takes half of it to arrive and the
+ * EndOfTurn event takes the other half to come back, on EVERY turn. Switching
+ * to `api.au.deepgram.com` is a ~75ms round-trip saving. Deepgram publishes no
+ * India or Singapore region.
+ *
+ * Left on the default so nothing changes silently — set DEEPGRAM_HOST to try a
+ * region. The same host serves the token grant and the WebSocket, and the API
+ * key is account-wide, so it is a single switch. VERIFY flux-general-multi is
+ * available in the region before committing (scripts/diag-deepgram.mjs).
+ */
+const DEEPGRAM_HOST = process.env.DEEPGRAM_HOST ?? "api.deepgram.com";
+const DEEPGRAM_API = `https://${DEEPGRAM_HOST}`;
 
 /** `flux-general-multi` detects and switches language mid-conversation. */
 export const DEEPGRAM_MODEL = process.env.DEEPGRAM_MODEL ?? "flux-general-multi";
@@ -63,7 +83,7 @@ export function buildListenUrl(): string {
   }
   for (const term of KEYTERMS) params.append("keyterm", term);
 
-  return `wss://api.deepgram.com/v2/listen?${params.toString()}`;
+  return `wss://${DEEPGRAM_HOST}/v2/listen?${params.toString()}`;
 }
 
 /**

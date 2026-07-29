@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { invalidateCorpus } from "@/lib/corpus";
 import { supabaseAdmin, DOCUMENTS_BUCKET } from "@/lib/supabase";
 
 export const runtime = "nodejs";
@@ -55,6 +56,9 @@ export async function DELETE(req: NextRequest) {
     if (error) {
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
+    // The corpus prefix just changed — drop the memo or full mode would keep
+    // answering from a document the caller deleted.
+    invalidateCorpus();
     return NextResponse.json({ ok: true });
   } catch (err) {
     return NextResponse.json(

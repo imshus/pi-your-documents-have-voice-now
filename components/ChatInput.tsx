@@ -76,7 +76,7 @@ export function ChatInput({
         accept="application/pdf,image/*,.csv,.xls,.xlsx,.doc,.docx,.txt,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/csv,text/plain"
         multiple
         className="hidden"
-        onChange={(e) => handleFiles(e.target.files)}
+        onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }}
       />
       <input
         ref={cameraInputRef}
@@ -84,7 +84,7 @@ export function ChatInput({
         accept="image/*"
         capture="environment"
         className="hidden"
-        onChange={(e) => handleFiles(e.target.files)}
+        onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }}
       />
 
       <div className="rounded-2xl border border-border bg-surface shadow-lift">

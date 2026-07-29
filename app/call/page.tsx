@@ -2,7 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { SpeechQueue, takeSentences } from "./speechQueue";
+import { SpeechQueue } from "./speechQueue";
+import { takeSentences } from "@/lib/sentences";
+import { askLanguage, ttsLanguage } from "@/lib/askLanguage";
 
 type DocSummary = {
   id: string;
@@ -25,6 +27,15 @@ const IDLE_END_MS = 20_000;
 // degrades Sarvam's pronunciation. Verb forms are feminine to match priya.
 const IDLE_PROMPT_LINE = "क्या आप सुन रहे हैं? कोई और सवाल हो तो बोलिए।";
 const IDLE_GOODBYE_LINE = "लगता है आप busy हैं। धन्यवाद, फिर बात करेंगे!";
+
+/**
+ * One TTS language for a whole turn. Shared with the chat route so the spoken
+ * number language and the reply's script are always the SAME decision — if they
+ * diverged the voice would read Hindi digits over an English sentence.
+ */
+function turnTtsLanguage(utterance: string): string {
+  return ttsLanguage(askLanguage(utterance));
+}
 
 /**
  * Worklet that batches mic frames before handing them to the main thread.
@@ -87,6 +98,14 @@ export default function CallPage() {
     committed: boolean;
     buffered: string[];
     historyMark: number;
+    // Caller's ask language (hi-IN when they asked in Hindi/Devanagari) — forces
+    // the spoken number language for this whole turn's audio.
+    lang?: string;
+    // Set when the eager stream finishes before the turn is confirmed: the
+    // answer is held here (invisible) until commitDraft surfaces it.
+    finalText?: string;
+    sawEnd?: boolean;
+    done?: boolean;
   } | null>(null);
   const callStartRef = useRef(0);
   /**
@@ -100,6 +119,10 @@ export default function CallPage() {
     inflight: boolean;
     lastFiredAt: number;
   }>({ for: "", results: null, inflight: false, lastFiredAt: 0 });
+  /** Set right before we close the socket ourselves, so onclose stays quiet. */
+  const intentionalCloseRef = useRef(false);
+  /** Aborts the in-flight /api/chat stream on barge-in or hang-up. */
+  const chatAbortRef = useRef<AbortController | null>(null);
   const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** 0 = fresh silence, 1 = already prompted once — next expiry hangs up. */
   const idleStageRef = useRef(0);
@@ -188,6 +211,10 @@ export default function CallPage() {
 
     p.inflight = true;
     p.lastFiredAt = Date.now();
+    // The turn this prime belongs to. If it resolves after the turn is over it
+    // must be dropped, or the NEXT turn answers from the previous utterance's
+    // retrieval results.
+    const primeGen = genRef.current;
     fetch("/api/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -198,6 +225,10 @@ export default function CallPage() {
     })
       .then((r) => r.json())
       .then((j) => {
+        if (primeGen !== genRef.current || statusRef.current !== "live") {
+          primeRef.current.inflight = false;
+          return;
+        }
         if (j.results) primeRef.current = { for: partial, results: j.results, inflight: false, lastFiredAt: p.lastFiredAt };
         else p.inflight = false;
       })
@@ -225,13 +256,18 @@ export default function CallPage() {
   // ------------------------------------------------------------ agent turn
   async function respondTo(utterance: string, speculative = false) {
     const gen = ++genRef.current;
-    const draft = speculative
+    // ONE language for the whole turn, resolved from the caller's ask. Resolving
+    // per sentence let a single Devanagari unit word flip mid-answer, so the
+    // voice and the number language changed between clips of one reply.
+    const turnLang = turnTtsLanguage(utterance);
+    const draft: NonNullable<typeof draftRef.current> | null = speculative
       ? {
           gen,
           transcript: utterance,
           committed: false,
-          buffered: [] as string[],
+          buffered: [],
           historyMark: historyRef.current.length,
+          lang: turnLang,
         }
       : null;
     draftRef.current = draft;
@@ -245,14 +281,22 @@ export default function CallPage() {
       const s = raw.replaceAll(END_MARKER, "").trim();
       if (!s) return;
       if (draft && !draft.committed) draft.buffered.push(s);
-      else queueRef.current?.push(s);
+      else queueRef.current?.push(s, turnLang);
     };
     let sawEndMarker = false;
+
+    // One controller per turn: barge-in and hang-up abort it, which also tells
+    // the server to stop the upstream generation instead of paying for tokens
+    // nobody will hear.
+    chatAbortRef.current?.abort();
+    const ac = new AbortController();
+    chatAbortRef.current = ac;
 
     try {
       const prime = primeRef.current;
       const res = await fetch("/api/chat", {
         method: "POST",
+        signal: ac.signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: utterance,
@@ -306,29 +350,43 @@ export default function CallPage() {
 
       if (full.includes(END_MARKER)) sawEndMarker = true;
       const cleaned = full.replaceAll(END_MARKER, "").trim();
-      historyRef.current = [...historyRef.current, { role: "assistant", content: cleaned }];
-      note("agent", cleaned);
 
-      // The model decided the caller is done: let the goodbye finish playing,
-      // then hang up — unless the caller barges in meanwhile (gen changes).
-      if (sawEndMarker) {
-        busyRef.current = false;
-        setThinking(false);
-        await queueRef.current?.idle();
-        if (gen === genRef.current && statusRef.current === "live") {
-          note("note", "caller said goodbye — agent ended the call");
-          hangUp();
-        }
+      // An unconfirmed speculative draft must stay INVISIBLE: stash the result
+      // and let commitDraft surface it. Writing the "agent" transcript line
+      // (or history, or the goodbye/hang-up) here for an eager guess that
+      // EndOfTurn later discards is exactly what showed the answer twice.
+      if (draft && !draft.committed) {
+        draft.finalText = cleaned;
+        draft.sawEnd = sawEndMarker;
+        draft.done = true;
         return;
       }
+
+      await finalizeAnswer(gen, cleaned, sawEndMarker);
+      return;
     } catch (err) {
-      if (gen === genRef.current) {
+      // An abort is us cancelling the turn, not a failure — never show it.
+      const aborted = err instanceof DOMException && err.name === "AbortError";
+      // A draft that died mid-stream must be marked terminal, or commitDraft
+      // would later speak its buffered half-answer with nothing in history.
+      if (draft && !draft.committed) {
+        draft.done = true;
+        draft.finalText = "";
+        draft.sawEnd = false;
+      }
+      if (!aborted && gen === genRef.current) {
         setError(err instanceof Error ? err.message : String(err));
       }
     } finally {
       if (gen === genRef.current) {
         busyRef.current = false;
         setThinking(false);
+        // The turn produced no audio (empty answer, error, abort): nothing will
+        // fire handleSpeaking(false), so re-arm the idle watchdog here or the
+        // call sits silent forever.
+        if (statusRef.current === "live" && !queueRef.current?.isSpeaking) {
+          armIdleTimer();
+        }
       }
     }
   }
@@ -339,6 +397,8 @@ export default function CallPage() {
     genRef.current++;
     busyRef.current = false;
     setThinking(false);
+    chatAbortRef.current?.abort();
+    chatAbortRef.current = null;
     queueRef.current?.cancel();
     queueRef.current = new SpeechQueue(handleSpeaking, handleTtsIssue);
     note("note", "interrupted");
@@ -353,16 +413,45 @@ export default function CallPage() {
     genRef.current++; // stops the draft's stream loop
     busyRef.current = false;
     setThinking(false);
+    chatAbortRef.current?.abort();
+    chatAbortRef.current = null;
     // Roll history back to before the draft's provisional user turn (and any
     // assistant turn the finished draft appended).
     historyRef.current = historyRef.current.slice(0, d.historyMark);
+    if (statusRef.current === "live" && !queueRef.current?.isSpeaking) armIdleTimer();
   }
 
   /** Release a draft's buffered speech — the turn is confirmed over. */
   function commitDraft(d: NonNullable<typeof draftRef.current>) {
     d.committed = true;
-    d.buffered.forEach((s) => queueRef.current?.push(s));
+    d.buffered.forEach((s) => queueRef.current?.push(s, d.lang));
     d.buffered = [];
+    // If the eager stream already finished while unconfirmed, its answer was
+    // stashed and never shown — surface it now that the turn is confirmed.
+    // finalText "" means the draft's stream failed: nothing to log or remember.
+    if (d.done && d.finalText) {
+      void finalizeAnswer(d.gen, d.finalText, d.sawEnd ?? false);
+    }
+  }
+
+  /**
+   * Surface a confirmed answer exactly once: the visible transcript line, the
+   * history entry the next turn is conditioned on, and (if the model ended the
+   * call) the goodbye-then-hang-up. Called from a non-speculative respondTo or,
+   * for an eager draft, from commitDraft — never from an unconfirmed guess.
+   */
+  async function finalizeAnswer(gen: number, cleaned: string, sawEnd: boolean) {
+    historyRef.current = [...historyRef.current, { role: "assistant", content: cleaned }];
+    note("agent", cleaned);
+    if (sawEnd) {
+      busyRef.current = false;
+      setThinking(false);
+      await queueRef.current?.idle();
+      if (gen === genRef.current && statusRef.current === "live") {
+        note("note", "caller said goodbye — agent ended the call");
+        hangUp();
+      }
+    }
   }
 
   // ------------------------------------------------------------- transport
@@ -458,6 +547,7 @@ export default function CallPage() {
     setLog([]);
     historyRef.current = [];
     draftRef.current = null;
+    intentionalCloseRef.current = false;
     queueRef.current = new SpeechQueue(handleSpeaking, handleTtsIssue);
 
     // Fire-and-forget: open the server's TLS pools to OpenAI/Supabase/Sarvam
@@ -482,15 +572,20 @@ export default function CallPage() {
         // Offline doc refresh must not block the call; scope falls back server-side.
       }
 
-      // 1. Short-lived Deepgram credential.
-      const tokenRes = await fetch("/api/voice/token", { method: "POST" });
-      const token = await tokenRes.json();
-      if (!tokenRes.ok || !token.access_token) {
-        throw new Error(token.error ?? "Could not get a Deepgram token.");
+      // 1. Mic FIRST. This must happen before the token is minted: the
+      //    permission prompt blocks for as long as the caller ignores it, and
+      //    the Deepgram token only lives 60s. Granting first meant a caller who
+      //    took a minute to click "Allow" always connected with an expired
+      //    token — a 401 on the handshake, which a browser WebSocket can only
+      //    report as a bare "error" + close 1006 with no reason. That is the
+      //    intermittent "deepgram not responding" with no detail.
+      //    navigator.mediaDevices only exists in a secure context (https or
+      //    localhost); over a plain-http LAN IP it is undefined, so guard first.
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error(
+          "Microphone unavailable. Open the app at http://localhost:3300 or over HTTPS — browsers block mic access on insecure origins."
+        );
       }
-
-      // 2. Mic at 16 kHz mono, with echo cancellation so the agent's own voice
-      //    coming out of the speakers does not retrigger the transcriber.
       const mic = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -500,6 +595,14 @@ export default function CallPage() {
         },
       });
       micRef.current = mic;
+
+      // 2. Short-lived Deepgram credential — minted only once the mic is in
+      //    hand, so the whole TTL is spent on the handshake, not on the prompt.
+      const tokenRes = await fetch("/api/voice/token", { method: "POST" });
+      const token = await tokenRes.json();
+      if (!tokenRes.ok || !token.access_token) {
+        throw new Error(token.error ?? "Could not get a Deepgram token.");
+      }
 
       const ctx = new AudioContext({ sampleRate: token.sample_rate });
       ctxRef.current = ctx;
@@ -515,8 +618,26 @@ export default function CallPage() {
       wsRef.current = ws;
 
       ws.onmessage = (e) => handleFlux(e.data as string);
-      ws.onerror = () => setError("Deepgram socket error.");
-      ws.onclose = () => setStatus((s) => (s === "live" ? "ended" : s));
+      // The browser's error event carries no detail by design — the actionable
+      // information is in the CLOSE frame, so report that instead of a bare
+      // "socket error" (1008/4001/4003 = auth or bad query param, 1006 =
+      // handshake never completed).
+      ws.onerror = () => console.warn("deepgram: socket error event");
+      ws.onclose = (e) => {
+        // Hanging up closes the socket on purpose — that must not raise the red
+        // banner. 1005 = "no status", which a normal browser-side close reports.
+        const expected =
+          intentionalCloseRef.current ||
+          statusRef.current === "ended" ||
+          e.code === 1000 ||
+          e.code === 1005;
+        if (!expected) {
+          setError(
+            `Deepgram closed the socket (code ${e.code}${e.reason ? `: ${e.reason}` : ""}). Run: node scripts/diag-deepgram.mjs`
+          );
+        }
+        setStatus((s) => (s === "live" ? "ended" : s));
+      };
 
       await new Promise<void>((resolve, reject) => {
         ws.onopen = () => resolve();
@@ -561,8 +682,8 @@ export default function CallPage() {
       // 5. Agent speaks first.
       const greeting =
         scopeRef.current === "all"
-          ? `नमस्ते! मैं account desk से बोल रही हूँ। आपके ${docs.length} documents मेरे पास हैं। बताइए, क्या जानना चाहेंगे?`
-          : "नमस्ते! मैं आपका document देख रही हूँ। बताइए, क्या जानना चाहेंगे?";
+          ? `नमस्ते! मैं account desk से बोल रही हूँ। आपके ${docs.length} documents मेरे पास हैं। बताइए।`
+          : "नमस्ते! मैं आपका document देख रही हूँ। बताइए।";
       note("agent", greeting);
       queueRef.current.push(greeting);
     } catch (err) {
@@ -585,11 +706,14 @@ export default function CallPage() {
     genRef.current++;
     busyRef.current = false;
     draftRef.current = null;
+    chatAbortRef.current?.abort();
+    chatAbortRef.current = null;
     queueRef.current?.cancel();
     clearIdleTimer();
     idleStageRef.current = 0;
     queueRef.current = null;
 
+    intentionalCloseRef.current = true;
     wsRef.current?.close();
     wsRef.current = null;
 

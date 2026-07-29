@@ -3,6 +3,7 @@ import { extractDocument } from "@/lib/extract";
 import { chunkDocument } from "@/lib/chunk";
 import { embed } from "@/lib/openai";
 import { supabaseAdmin, DOCUMENTS_BUCKET } from "@/lib/supabase";
+import { invalidateCorpus } from "@/lib/corpus";
 import { TEXT_CONVERTIBLE, extractTextFromFile, resolveMimeType } from "@/lib/parseDocument";
 
 export const runtime = "nodejs";
@@ -44,6 +45,13 @@ const VISION_ACCEPTED = new Set([
 const ACCEPTED = new Set([...VISION_ACCEPTED, ...TEXT_CONVERTIBLE]);
 
 /**
+ * Each file is held in memory several times over (Buffer + base64 + the JSON
+ * payload), so an unbounded upload is an OOM, not just a slow request.
+ */
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES ?? 20_000_000);
+const MAX_FILES_PER_REQUEST = 10;
+
+/**
  * Step 2 + 3 of the pipeline:
  *   file -> vision extraction -> JSON -> documents row -> chunks -> embeddings.
  * Accepts one or more files under the `files` field of a multipart form.
@@ -60,6 +68,12 @@ export async function POST(req: NextRequest) {
   if (files.length === 0) {
     return NextResponse.json({ error: "No files uploaded." }, { status: 400 });
   }
+  if (files.length > MAX_FILES_PER_REQUEST) {
+    return NextResponse.json(
+      { error: `Too many files (max ${MAX_FILES_PER_REQUEST} per upload).` },
+      { status: 400 }
+    );
+  }
 
   let db;
   try {
@@ -74,8 +88,21 @@ export async function POST(req: NextRequest) {
   const results: unknown[] = [];
 
   for (const file of files) {
+    // Tracked so a failure AFTER the row exists (embedding, chunk insert) can
+    // roll it back — a chunk-less document row is invisible to retrieval but
+    // still lists in the UI and still holds the extracted PII.
+    let createdId: string | null = null;
+    let storedPath: string | null = null;
     try {
       const mimeType = resolveMimeType(file.type, file.name);
+      if (file.size > MAX_UPLOAD_BYTES) {
+        results.push({
+          file_name: file.name,
+          ok: false,
+          error: `File too large (${(file.size / 1e6).toFixed(1)} MB, limit ${MAX_UPLOAD_BYTES / 1e6} MB).`,
+        });
+        continue;
+      }
       if (!ACCEPTED.has(mimeType)) {
         results.push({
           file_name: file.name,
@@ -126,6 +153,8 @@ export async function POST(req: NextRequest) {
       if (insertError || !row) {
         throw new Error(`Insert failed: ${insertError?.message ?? "no row returned"}`);
       }
+      createdId = row.id;
+      if (!upload.error) storedPath = storagePath;
 
       // --- chunk + embed ----------------------------------------------------
       const chunks = chunkDocument(data, file.name);
@@ -141,10 +170,10 @@ export async function POST(req: NextRequest) {
         }))
       );
       if (chunkError) {
-        // Leave no half-indexed document behind.
-        await db.from("documents").delete().eq("id", row.id);
         throw new Error(`Chunk insert failed: ${chunkError.message}`);
       }
+      createdId = null; // fully indexed — nothing to roll back
+      storedPath = null;
 
       results.push({
         file_name: file.name,
@@ -158,6 +187,15 @@ export async function POST(req: NextRequest) {
         data,
       });
     } catch (err) {
+      // Roll back whatever this file already created, so a failed ingest never
+      // leaves an unsearchable row or an orphaned original in the bucket.
+      if (createdId) {
+        const { error } = await db.from("documents").delete().eq("id", createdId);
+        if (error) console.error("[ingest] rollback failed", createdId, error.message);
+      }
+      if (storedPath) {
+        await db.storage.from(DOCUMENTS_BUCKET).remove([storedPath]);
+      }
       results.push({
         file_name: file.name,
         ok: false,
@@ -165,6 +203,10 @@ export async function POST(req: NextRequest) {
       });
     }
   }
+
+  // A new document changes the corpus prefix — drop the memo so the next call
+  // rebuilds it (and deliberately re-seeds the provider cache once).
+  invalidateCorpus();
 
   const failed = results.filter((r) => !(r as { ok: boolean }).ok).length;
   return NextResponse.json(

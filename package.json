@@ -7,6 +7,8 @@
     "build": "next build",
     "start": "next start -p 3300",
     "typecheck": "tsc --noEmit",
+    "test:logic": "node --experimental-strip-types --disable-warning=ExperimentalWarning --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/test-logic.mts",
+    "eval": "node --experimental-strip-types --disable-warning=ExperimentalWarning --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/eval-accuracy.mts",
     "verify": "node scripts/verify.mjs"
   },
   "dependencies": {

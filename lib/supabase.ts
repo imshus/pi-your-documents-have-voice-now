@@ -1,6 +1,22 @@
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { fetch as undiciFetch, Agent } from "undici";
 
 export const DOCUMENTS_BUCKET = "documents";
+
+/**
+ * supabase-js calls the GLOBAL fetch, whose undici dispatcher defaults to a
+ * 4s keepAliveTimeout — and *.supabase.co sends `Connection: keep-alive` with
+ * no `Keep-Alive: timeout=` hint, so undici applies that 4s default. Every
+ * inter-turn gap on a phone call is longer than 4s, so retrieval was paying a
+ * fresh TCP+TLS handshake EVERY caller turn, on the leg that sits directly in
+ * the voice latency path. OpenAI, DeepSeek and Sarvam already had their own
+ * long-lived agents; Supabase was the one that was missed.
+ */
+const supabaseAgent = new Agent({
+  keepAliveTimeout: 120_000,
+  keepAliveMaxTimeout: 600_000,
+  allowH2: true,
+});
 
 let cached: SupabaseClient | null = null;
 
@@ -22,6 +38,16 @@ export function supabaseAdmin(): SupabaseClient {
 
   cached = createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false },
+    // Route every PostgREST/storage call through the warm pool above instead of
+    // Node's global fetch. (Cast: undici's fetch signature is structurally
+    // compatible but not nominally identical to the DOM one supabase-js wants.)
+    global: {
+      fetch: ((input: unknown, init?: Record<string, unknown>) =>
+        undiciFetch(input as never, {
+          ...(init ?? {}),
+          dispatcher: supabaseAgent,
+        } as never)) as unknown as typeof fetch,
+    },
   });
   return cached;
 }

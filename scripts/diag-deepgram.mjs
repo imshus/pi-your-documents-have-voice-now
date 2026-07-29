@@ -25,6 +25,9 @@ const KEY = env.DEEPGRAM_API_KEY;
 if (!KEY) { console.error("No DEEPGRAM_API_KEY in .env/.env.local"); process.exit(1); }
 
 const MODEL = process.argv[2] ?? env.DEEPGRAM_MODEL ?? "flux-general-multi";
+// Same host for grant + socket, so `DEEPGRAM_HOST=api.au.deepgram.com node
+// scripts/diag-deepgram.mjs` verifies a region really serves this model.
+const HOST = process.env.DEEPGRAM_HOST ?? env.DEEPGRAM_HOST ?? "api.deepgram.com";
 
 function buildUrl(model) {
   const p = new URLSearchParams({
@@ -38,11 +41,11 @@ function buildUrl(model) {
   });
   if (model.endsWith("-multi")) for (const h of (env.DEEPGRAM_LANGUAGE_HINTS ?? "hi,en").split(",")) p.append("language_hint", h.trim());
   for (const t of (env.DEEPGRAM_KEYTERMS ?? "Aadhaar,IFSC,PAN,KYC,passbook").split(",")) p.append("keyterm", t.trim());
-  return `wss://api.deepgram.com/v2/listen?${p.toString()}`;
+  return `wss://${HOST}/v2/listen?${p.toString()}`;
 }
 
 async function grant() {
-  const res = await fetch("https://api.deepgram.com/v1/auth/grant", {
+  const res = await fetch(`https://${HOST}/v1/auth/grant`, {
     method: "POST",
     headers: { Authorization: `Token ${KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({ ttl_seconds: 60 }),
@@ -53,6 +56,7 @@ async function grant() {
 }
 
 const url = buildUrl(MODEL);
+console.log(`host=${HOST}`);
 console.log(`model=${MODEL}`);
 console.log(`url=${url}`);
 

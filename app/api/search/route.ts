@@ -19,12 +19,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Missing `query`." }, { status: 400 });
   }
 
+  // Coerce before clamping: Math.min/max propagate NaN, which reached the SQL
+  // LIMIT and collapsed the result set.
+  const k = Number(body.top_k);
+  const topK = Number.isFinite(k) ? Math.min(Math.max(Math.trunc(k), 1), 20) : 8;
+
   try {
-    const results = await retrieve(
-      query,
-      body.document_id ?? null,
-      Math.min(Math.max(body.top_k ?? 8, 1), 20)
-    );
+    const results = await retrieve(query, body.document_id ?? null, topK);
     return NextResponse.json({ query, results });
   } catch (err) {
     return NextResponse.json(

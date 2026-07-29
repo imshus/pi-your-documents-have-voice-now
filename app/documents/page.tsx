@@ -23,6 +23,7 @@ export default function DocumentsPage() {
 
   async function load() {
     setLoading(true);
+    setError(null); // else a transient failure pins the banner forever
     try {
       const res = await fetch("/api/documents?full=1");
       const json = await res.json();
@@ -41,8 +42,20 @@ export default function DocumentsPage() {
 
   async function remove(id: string) {
     if (!confirm("Delete this document and its indexed chunks?")) return;
-    const res = await fetch(`/api/documents?id=${id}`, { method: "DELETE" });
-    if (res.ok) setDocs((prev) => prev.filter((d) => d.id !== id));
+    // A failed delete used to be swallowed: the row stayed, the user saw
+    // nothing, and the agent kept answering from a document they thought gone.
+    try {
+      const res = await fetch(`/api/documents?id=${id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setError(body.error ?? `Delete failed (${res.status}).`);
+        return;
+      }
+      setError(null);
+      setDocs((prev) => prev.filter((d) => d.id !== id));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   return (

@@ -1,7 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
-import { speak } from "@/lib/sarvam";
+import { speak, TTS_LANGUAGE, TTS_LANGUAGE_EN } from "@/lib/sarvam";
 
 export const runtime = "nodejs";
+
+/**
+ * Only the two languages this agent speaks reach Sarvam's request body — an
+ * arbitrary query param must never be forwarded upstream. Empty string and
+ * unknown codes fall back to per-text inference.
+ */
+function safeLang(raw: string | null | undefined): string | undefined {
+  return raw === TTS_LANGUAGE || raw === TTS_LANGUAGE_EN ? raw : undefined;
+}
 
 function streamOut(upstream: Response): Response {
   return new Response(upstream.body, {
@@ -25,12 +34,13 @@ function streamOut(upstream: Response): Response {
  */
 export async function GET(req: NextRequest) {
   const text = (req.nextUrl.searchParams.get("text") ?? "").trim();
+  const lang = safeLang(req.nextUrl.searchParams.get("lang"));
   if (!text) {
     return NextResponse.json({ error: "Missing `text`." }, { status: 400 });
   }
 
   try {
-    return streamOut(await speak(text));
+    return streamOut(await speak(text, lang));
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : String(err) },
@@ -41,13 +51,16 @@ export async function GET(req: NextRequest) {
 
 /** POST variant for scripted checks (verify.mjs). Same stream out. */
 export async function POST(req: NextRequest) {
-  const { text } = (await req.json().catch(() => ({}))) as { text?: string };
+  const { text, lang } = (await req.json().catch(() => ({}))) as {
+    text?: string;
+    lang?: string;
+  };
   if (!text?.trim()) {
     return NextResponse.json({ error: "Missing `text`." }, { status: 400 });
   }
 
   try {
-    return streamOut(await speak(text.trim()));
+    return streamOut(await speak(text.trim(), safeLang(lang)));
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : String(err) },
