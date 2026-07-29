@@ -739,7 +739,7 @@ export default function CallPage() {
   return (
     <div className="space-y-7">
       <Link href="/" className="inline-flex items-center gap-1.5 text-[13px] text-ink-muted transition hover:text-ink">
-        ← Back to chat
+        ← Back
       </Link>
 
       <div>
