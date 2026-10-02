@@ -115,6 +115,26 @@ export function targetRow(text: string): string | null {
 }
 
 /**
+ * Row carried over from the PREVIOUS turn — "item 5 ka amount?" … "uska weight?"
+ * The follow-up names no row, so targetRow() finds nothing, focusRow never
+ * fires, and the model is back to counting pipe columns for exactly the
+ * question shape callers use most. The anaphora words are unambiguous
+ * ("uska"/"iska"/"same"), so carrying the row is deterministic, not a guess.
+ */
+const ANAPHORA = /\b(uska|uska|iska|usi|isi|same)\b|उसका|उसकी|इसका|इसकी|उसी|इसी/i;
+
+export function carriedRow(
+  message: string,
+  prevUtterance: string | null | undefined
+): string | null {
+  if (!prevUtterance) return null;
+  // The current message must reference no row of its own AND point backwards.
+  if (targetRow(message) !== null) return null;
+  if (!ANAPHORA.test(message)) return null;
+  return targetRow(prevUtterance);
+}
+
+/**
  * Finds runs of >=4 consecutive number words and returns their digit strings.
  * The length floor keeps amounts ("do lakh") and counts ("teen documents")
  * from being mangled — only identifier-length runs qualify.

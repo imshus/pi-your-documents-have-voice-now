@@ -45,6 +45,19 @@ export function FileTextIcon({ className }: IconProps) {
   );
 }
 
+export function FolderIcon({ className }: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className={className}>
+      <path
+        d="M3.5 6.5a1 1 0 011-1H9l2 2h8a1 1 0 011 1V18a1 1 0 01-1 1H4.5a1 1 0 01-1-1V6.5z"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 export function ImageIcon({ className }: IconProps) {
   return (
     <svg viewBox="0 0 24 24" fill="none" className={className}>

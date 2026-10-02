@@ -21,6 +21,36 @@ export class SpeechQueue {
     private readonly onError: (message: string) => void
   ) {}
 
+  /** Audio already synthesized ahead of time, keyed by its request URL. */
+  private preloaded = new Map<string, HTMLAudioElement>();
+
+  private urlFor(text: string, lang?: string): string {
+    const q = lang ? `&lang=${encodeURIComponent(lang)}` : "";
+    return `/api/tts?text=${encodeURIComponent(text.trim())}${q}`;
+  }
+
+  /**
+   * Start synthesizing a KNOWN phrase before it is needed, without queueing it.
+   * The greeting is fixed and its text is known the moment the caller taps
+   * "call" — so it can be synthesized during mic permission, the token grant
+   * and the WebSocket handshake, which cost hundreds of ms of otherwise idle
+   * time. By the time the call goes live the audio is already buffered and the
+   * greeting starts instantly instead of paying a full synthesis round trip.
+   *
+   * A later push() of the same text+lang picks the buffered element up.
+   */
+  prewarm(text: string, lang?: string) {
+    const clean = text.trim();
+    if (this.cancelled || !clean) return;
+    const url = this.urlFor(clean, lang);
+    if (this.preloaded.has(url)) return;
+
+    const audio = new Audio(url);
+    audio.preload = "auto";
+    audio.load(); // kick the fetch now rather than at first play
+    this.preloaded.set(url, audio);
+  }
+
   /**
    * Queue one sentence. Synthesis starts immediately; playback stays ordered.
    * `lang` (hi-IN | en-IN) forces the spoken number language to the caller's
@@ -29,8 +59,13 @@ export class SpeechQueue {
   push(text: string, lang?: string) {
     if (this.cancelled || !text.trim()) return;
 
-    const q = lang ? `&lang=${encodeURIComponent(lang)}` : "";
-    const audio = new Audio(`/api/tts?text=${encodeURIComponent(text.trim())}${q}`);
+    const url = this.urlFor(text, lang);
+    // Reuse a prewarmed element when the text matches exactly; it has been
+    // downloading since before the call connected.
+    const ready = this.preloaded.get(url);
+    if (ready) this.preloaded.delete(url);
+
+    const audio = ready ?? new Audio(url);
     audio.preload = "auto"; // begin fetching (= synthesizing) right away
     this.pending.push(audio);
 
@@ -138,6 +173,13 @@ export class SpeechQueue {
   /** Barge-in: stop mid-sentence and drop everything still queued. */
   cancel() {
     this.cancelled = true;
+    // Prewarmed clips that were never played still hold an open fetch.
+    for (const a of this.preloaded.values()) {
+      a.pause();
+      a.removeAttribute("src");
+      a.load();
+    }
+    this.preloaded.clear();
     for (const a of this.pending) a.src = "";
     this.pending = [];
     if (this.current) {

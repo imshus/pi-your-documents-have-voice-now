@@ -3,12 +3,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Sidebar, SidebarDocumentsBadge } from "@/components/Sidebar";
-import { FileTextIcon, ImageIcon, PhoneIcon, PlusIcon, SparkIcon, XIcon } from "@/components/icons";
+import { FileTextIcon, FolderIcon, ImageIcon, PhoneIcon, PlusIcon, SparkIcon, XIcon } from "@/components/icons";
 import type { DocumentSummary } from "@/lib/types";
 
 function uid() {
   return Math.random().toString(36).slice(2, 10);
 }
+
+// The ingest route indexes at most this many files per request (MAX_FILES_PER_
+// REQUEST). A dropped folder can hold far more, so the client uploads in batches
+// of this size instead of one oversized request that would be rejected whole.
+const BATCH_SIZE = 10;
+
+// A folder pick returns everything inside it — junk (.DS_Store, thumbs.db) and
+// media the pipeline can't read. Keep only the types the ingest route accepts,
+// so the results list isn't buried under "unsupported type" rows.
+const ACCEPTED_EXT = /\.(pdf|png|jpe?g|webp|gif|csv|xlsx?|docx?|txt)$/i;
 
 function formatSize(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
@@ -30,7 +40,18 @@ export default function Home() {
   const [results, setResults] = useState<ResultStatus[]>([]);
   const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
+
+  // webkitdirectory isn't in React's input typings; set it on the DOM node so a
+  // folder pick returns the whole tree. `directory` is the standards-track name.
+  useEffect(() => {
+    const el = folderInputRef.current;
+    if (el) {
+      el.setAttribute("webkitdirectory", "");
+      el.setAttribute("directory", "");
+    }
+  }, []);
 
   const loadDocuments = useCallback(async () => {
     try {
@@ -47,7 +68,9 @@ export default function Home() {
   }, [loadDocuments]);
 
   function addFiles(fileList: FileList | File[]) {
-    const files = Array.from(fileList).map((file) => ({ id: uid(), file }));
+    const files = Array.from(fileList)
+      .filter((file) => ACCEPTED_EXT.test(file.name))
+      .map((file) => ({ id: uid(), file }));
     setPending((prev) => [...prev, ...files]);
   }
 
@@ -60,99 +83,51 @@ export default function Home() {
     setBusy(true);
     setResults([]);
 
-    const form = new FormData();
-    pending.forEach((p) => form.append("files", p.file, p.file.name));
+    const all = [...pending];
+    const collected: ResultStatus[] = [];
+    const failedNames = new Set<string>();
 
     try {
-      const res = await fetch("/api/ingest", { method: "POST", body: form });
-      const json = await res.json();
+      // Upload in batches so a whole folder (possibly hundreds of files) never
+      // trips the ingest route's per-request cap. The first batch also triggers
+      // ensureSchema() server-side, so the tables exist before anything inserts.
+      for (let i = 0; i < all.length; i += BATCH_SIZE) {
+        const batch = all.slice(i, i + BATCH_SIZE);
+        const form = new FormData();
+        batch.forEach((p) => form.append("files", p.file, p.file.name));
 
-      if (json.results) {
-        const list = json.results as IngestResult[];
-        setResults(list.map((r) => ({ id: uid(), name: r.file_name, ok: r.ok, error: r.error })));
-        const failedNames = new Set(list.filter((r) => !r.ok).map((r) => r.file_name));
-        setPending((prev) => prev.filter((p) => failedNames.has(p.file.name)));
-        loadDocuments();
-      } else {
-        setResults([{ id: uid(), name: "Upload", ok: false, error: json.error ?? `Failed (${res.status}).` }]);
+        try {
+          const res = await fetch("/api/ingest", { method: "POST", body: form });
+          const json = await res.json();
+          if (json.results) {
+            for (const r of json.results as IngestResult[]) {
+              collected.push({ id: uid(), name: r.file_name, ok: r.ok, error: r.error });
+              if (!r.ok) failedNames.add(r.file_name);
+            }
+          } else {
+            // Whole-batch failure (e.g. schema could not be auto-created).
+            for (const p of batch) {
+              collected.push({ id: uid(), name: p.file.name, ok: false, error: json.error ?? `Failed (${res.status}).` });
+              failedNames.add(p.file.name);
+            }
+          }
+        } catch (err) {
+          for (const p of batch) {
+            collected.push({ id: uid(), name: p.file.name, ok: false, error: err instanceof Error ? err.message : String(err) });
+            failedNames.add(p.file.name);
+          }
+        }
+        setResults([...collected]); // progressive feedback across batches
       }
-    } catch (err) {
-      setResults([{ id: uid(), name: "Upload", ok: false, error: err instanceof Error ? err.message : String(err) }]);
+
+      // Keep only the files that failed, so a retry re-sends just those.
+      setPending((prev) => prev.filter((p) => failedNames.has(p.file.name)));
+      loadDocuments();
     } finally {
       setBusy(false);
     }
   }
 
-<<<<<<< HEAD
-  async function sendChatMessage(text: string) {
-    const history = messages
-      .filter((m) => m.content)
-      .slice(-8)
-      .map((m) => ({ role: m.role, content: m.content }));
-
-    const pendingId = uid();
-    setMessages((prev) => [...prev, { id: pendingId, role: "assistant", content: "", pending: true }]);
-
-    try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, history, document_id: null }),
-      });
-
-      if (!res.ok || !res.body) {
-        const body = await res.json().catch(() => ({}));
-        updateMessage(pendingId, { content: body.error ?? `Chat failed (${res.status}).`, pending: false });
-        return;
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let full = "";
-
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        full += decoder.decode(value, { stream: true });
-        updateMessage(pendingId, { content: full, pending: true });
-      }
-      full += decoder.decode(); // flush any buffered multi-byte tail
-
-      updateMessage(pendingId, { content: full.trim() || "…", pending: false });
-    } catch (err) {
-      updateMessage(pendingId, {
-        content: err instanceof Error ? err.message : String(err),
-        pending: false,
-      });
-    }
-  }
-
-  function handleSend(text: string, files: PendingFile[]) {
-    const attachments: Attachment[] = files.map((f) => ({
-      id: uid(),
-      name: f.file.name,
-      kind: f.kind,
-      sizeLabel: formatSize(f.file.size),
-    }));
-
-    if (text || attachments.length) {
-      setMessages((prev) => [
-        ...prev,
-        { id: uid(), role: "user", content: text, attachments: attachments.length ? attachments : undefined },
-      ]);
-    }
-
-    // Sequence, don't drop: sending a file WITH a question used to `return`
-    // after ingest and silently discard the question. Awaiting also means
-    // retrieval sees the freshly indexed chunks.
-    void (async () => {
-      if (files.length > 0) await ingestFiles(files);
-      if (text) await sendChatMessage(text);
-    })();
-  }
-
-=======
->>>>>>> b9fbf4be1f889ad64122a4b91a76a4d6a6c6ca51
   return (
     <div className="flex h-dvh overflow-hidden bg-canvas">
       <Sidebar documents={documents} open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
@@ -186,6 +161,16 @@ export default function Home() {
             type="file"
             multiple
             accept="application/pdf,image/*,.csv,.xls,.xlsx,.doc,.docx,.txt,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/csv,text/plain"
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files?.length) addFiles(e.target.files);
+              e.target.value = "";
+            }}
+          />
+          <input
+            ref={folderInputRef}
+            type="file"
+            multiple
             className="hidden"
             onChange={(e) => {
               if (e.target.files?.length) addFiles(e.target.files);
@@ -230,6 +215,14 @@ export default function Home() {
               </button>
               <button
                 type="button"
+                onClick={() => folderInputRef.current?.click()}
+                aria-label="Add a folder"
+                className="flex h-14 w-14 items-center justify-center rounded-full border border-border text-ink-muted transition hover:border-ink-faint hover:text-ink active:scale-95"
+              >
+                <FolderIcon className="h-6 w-6" />
+              </button>
+              <button
+                type="button"
                 onClick={() => cameraInputRef.current?.click()}
                 aria-label="Use camera"
                 className="flex h-14 w-14 items-center justify-center rounded-full border border-border text-ink-muted transition hover:border-ink-faint hover:text-ink active:scale-95"
@@ -238,7 +231,7 @@ export default function Home() {
               </button>
             </div>
             <p className="mt-4 text-[13px] text-ink-muted">
-              Click <span className="text-ink">+</span> to choose files, or drop them here.
+              Click <span className="text-ink">+</span> for files, the folder icon for a whole folder, or drop them here.
             </p>
           </div>
 

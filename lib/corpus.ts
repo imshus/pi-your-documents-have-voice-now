@@ -23,7 +23,7 @@
  */
 
 import { supabaseAdmin } from "./supabase";
-import { renderCorpus, estimateTokens, type CorpusDoc } from "./corpusFormat";
+import { renderCorpus, corpusChunks, estimateTokens, type CorpusDoc } from "./corpusFormat";
 
 /**
  * Refuse to inline a corpus larger than this. Deliberately well under the
@@ -38,7 +38,15 @@ export type CorpusMode = "hybrid" | "full";
 export const CORPUS_MODE: CorpusMode =
   process.env.RETRIEVAL_MODE === "full" ? "full" : "hybrid";
 
-type CacheEntry = { text: string; tokens: number; docCount: number };
+import type { Chunk } from "./chunk";
+
+type CacheEntry = {
+  text: string;
+  tokens: number;
+  docCount: number;
+  /** Chunk-shaped pieces of the same corpus, so focusRow works in full mode. */
+  chunks: Chunk[];
+};
 
 /**
  * Per-scope memo. The built string MUST be byte-identical between turns or the
@@ -85,7 +93,12 @@ export async function buildCorpus(
     return null;
   }
 
-  const entry = { text, tokens, docCount: data.length };
+  const entry = {
+    text,
+    tokens,
+    docCount: data.length,
+    chunks: corpusChunks(data as CorpusDoc[]),
+  };
   memo.set(key, entry);
   return entry;
 }

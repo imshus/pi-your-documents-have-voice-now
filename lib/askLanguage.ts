@@ -48,6 +48,12 @@ export function ttsLanguage(lang: AskLanguage): string {
  */
 export function replyDirective(lang: AskLanguage): string {
   return lang === "hi"
-    ? "REPLY LANGUAGE FOR THIS TURN: Hinglish. Write every Hindi word in Devanagari (है, नहीं, कितना). English loanwords stay in Latin (total, amount, weight)."
+    ? // The "do not copy" clause is load-bearing. When the caller typed romanized
+      // Hindi ("athvi item ka amount kitna hai?"), the model mirrored their
+      // spelling back — "Athvi item ka amount 34,142 rupees hai." — and once one
+      // Latin Hindi word is on the page it finishes the whole sentence that way.
+      // Mirroring the caller's wording is otherwise desirable, so it has to be
+      // overridden explicitly for script.
+      "REPLY LANGUAGE FOR THIS TURN: Hinglish. Write every Hindi word in Devanagari (है, नहीं, कितना, आठवीं). English loanwords stay in Latin (total, amount, weight). Do NOT copy the caller's spelling of Hindi words — they may have typed Hindi in Latin letters (athvi, kitna, hai); convert those to Devanagari (आठवीं, कितना, है). Not one Hindi word in Latin letters."
     : "REPLY LANGUAGE FOR THIS TURN: English only. Plain English sentence. No Devanagari, and no Hindi words in Latin letters either — do not end with 'hai'.";
 }

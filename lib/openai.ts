@@ -19,12 +19,12 @@ const openaiAgent = new Agent({
 });
 
 /**
- * Vision + structured-output model used to read the uploaded document.
- * gpt-5.5 is the measured leader for verbatim OCR (91.2%) and targeted
- * extraction (87.6%) as of July 2026 — gpt-5.6-sol/terra both score lower on
- * transcription-style tasks. (gpt-5-mini is deprecated, shutdown 2026-12-11.)
+ * Vision + structured-output model used to read the uploaded document:
+ * GPT-6 Luna, like every other workload here. (gpt-5.5 led the July 2026
+ * OCR/extraction measurements at 91.2% / 87.6%; re-check a few dense pages
+ * on Luna.) OPENAI_VISION_MODEL overrides it.
  */
-export const VISION_MODEL = process.env.OPENAI_VISION_MODEL ?? "gpt-5.5";
+export const VISION_MODEL = process.env.OPENAI_VISION_MODEL ?? "gpt-6-luna";
 /**
  * text-embedding-3-large at dimensions=1536: Matryoshka-trained, so
  * large@1536 beats small@1536 outright (MIRACL 54.9 vs 44.0 multilingual)
@@ -48,11 +48,11 @@ export const EMBEDDING_MODEL = (() => {
 export const EMBEDDING_DIMS = 1536;
 /**
  * OpenAI answering model — used only when CHAT_PROVIDER=openai (the default is
- * DeepSeek; see lib/deepseek.ts and lib/chat.ts). gpt-5.6-luna at reasoning
+ * DeepSeek; see lib/deepseek.ts and lib/chat.ts). gpt-6-luna at reasoning
  * effort "none": ~0.75s TTFT. Effort MUST be pinned to "none" in the call —
  * 5.6 models silently default to "medium", which adds ~1.3s of TTFT.
  */
-export const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL ?? "gpt-5.6-luna";
+export const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL ?? "gpt-6-luna";
 
 function apiKey(): string {
   const key = process.env.OPENAI_API_KEY;

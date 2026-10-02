@@ -75,35 +75,20 @@ export type MatchedChunk = {
 };
 
 /** Shape produced by lib/extract.ts — kept here so both client and server can import it. */
+/**
+ * Table-first extraction. The document is stored as its TABLE(S) plus a
+ * verbatim full_text and a short summary — nothing else. The old rich schema
+ * (account_holder, parties, fields, dates, amounts, …) gave the vision model a
+ * dozen fuzzy buckets to sort values into, and it lost data doing so (it
+ * dropped a diamond's second clarity code out of a table cell). Tables are the
+ * one thing these documents ARE, so extraction transcribes them faithfully;
+ * anything not in a table still lives verbatim in full_text and is retrievable.
+ */
 export type ExtractedDocument = {
   document_type: string;
   title: string;
   summary: string;
-  issuer: string | null;
-  account_holder: {
-    name: string | null;
-    address: string | null;
-    date_of_birth: string | null;
-    contact: string | null;
-    identifiers: { label: string; value: string }[];
-  };
-  account: {
-    number: string | null;
-    type: string | null;
-    ifsc_or_routing: string | null;
-    branch: string | null;
-    currency: string | null;
-    opened_on: string | null;
-    status: string | null;
-    balance: string | null;
-  };
-  parties: { role: string; name: string; details: string }[];
-  fields: { label: string; value: string }[];
   tables: { name: string; columns: string[]; rows: string[][] }[];
-  dates: { label: string; value: string }[];
-  amounts: { label: string; value: string }[];
-  remarks: string[];
-  stamps_and_annotations: string[];
   full_text: string;
   confidence_notes: string;
 };

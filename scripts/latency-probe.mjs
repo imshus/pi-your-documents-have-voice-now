@@ -29,8 +29,24 @@ function projectRef() {
 
 const ref = projectRef();
 
+function envHost() {
+  for (const file of [".env.local", ".env"]) {
+    try {
+      const raw = readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
+      const m = raw.match(/^\s*DEEPGRAM_HOST\s*=\s*(\S+)/m);
+      if (m) return m[1];
+    } catch { /* ignore */ }
+  }
+  return null;
+}
+
 const HOSTS = [
-  { name: "Deepgram  (STT)", host: "api.deepgram.com", note: "default endpoint = North America" },
+  {
+    name: "Deepgram  (STT)",
+    // Honour the configured region so the probe measures what the app uses.
+    host: process.env.DEEPGRAM_HOST ?? envHost() ?? "api.deepgram.com",
+    note: "set by DEEPGRAM_HOST",
+  },
   { name: "OpenAI    (embed)", host: "api.openai.com", note: "US — serial before Supabase on a prefetch miss" },
   ...(ref
     ? [{ name: "Supabase  (retrieve)", host: `${ref}.supabase.co`, note: "your project region" }]

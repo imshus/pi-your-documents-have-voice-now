@@ -5,6 +5,8 @@ import Link from "next/link";
 import { SpeechQueue } from "./speechQueue";
 import { takeSentences } from "@/lib/sentences";
 import { askLanguage, ttsLanguage } from "@/lib/askLanguage";
+import { startConnectingTone } from "./ringtone";
+import { docLabel } from "@/lib/docLabel";
 
 type DocSummary = {
   id: string;
@@ -12,6 +14,7 @@ type DocSummary = {
   doc_type: string | null;
   title: string | null;
   summary: string | null;
+  created_at: string | null;
 };
 
 type Turn = { role: "user" | "assistant"; content: string };
@@ -27,6 +30,12 @@ const IDLE_END_MS = 20_000;
 // degrades Sarvam's pronunciation. Verb forms are feminine to match priya.
 const IDLE_PROMPT_LINE = "क्या आप सुन रहे हैं? कोई और सवाल हो तो बोलिए।";
 const IDLE_GOODBYE_LINE = "लगता है आप busy हैं। धन्यवाद, फिर बात करेंगे!";
+/**
+ * The greeting and the idle lines are Devanagari, so they are spoken hi-IN.
+ * Pinned explicitly rather than inferred, because prewarm() and push() must
+ * build the SAME /api/tts URL or the buffered audio is not reused.
+ */
+const GREETING_LANG = "hi-IN";
 
 /**
  * One TTS language for a whole turn. Shared with the chat route so the spoken
@@ -68,7 +77,7 @@ registerProcessor('capture', Capture);
 
 export default function CallPage() {
   const [docs, setDocs] = useState<DocSummary[]>([]);
-  const [scope, setScope] = useState("all");
+  const [scope, setScope] = useState("");
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
   const [log, setLog] = useState<LogLine[]>([]);
@@ -119,6 +128,20 @@ export default function CallPage() {
     inflight: boolean;
     lastFiredAt: number;
   }>({ for: "", results: null, inflight: false, lastFiredAt: 0 });
+  /**
+   * Identifies this call to the server's conversation log, which keeps the
+   * byte-exact messages it already sent so DeepSeek's prefix cache can grow.
+   * Regenerated per call so two calls never share a prefix.
+   */
+  const callIdRef = useRef<string>("");
+  /**
+   * Highest generation whose answer has already been surfaced (transcript line
+   * + history). finalizeAnswer refuses to run twice for one gen — the guard
+   * that makes "agent answered twice" structurally impossible.
+   */
+  const finalizedGenRef = useRef(-1);
+  /** Stops the "connecting" ringback; set while the call is being set up. */
+  const ringtoneStopRef = useRef<(() => void) | null>(null);
   /** Set right before we close the socket ourselves, so onclose stays quiet. */
   const intentionalCloseRef = useRef(false);
   /** Aborts the in-flight /api/chat stream on barge-in or hang-up. */
@@ -131,7 +154,7 @@ export default function CallPage() {
   useEffect(() => {
     statusRef.current = status;
   }, [status]);
-  const scopeRef = useRef("all");
+  const scopeRef = useRef("");
   const logBoxRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -141,7 +164,21 @@ export default function CallPage() {
   useEffect(() => {
     fetch("/api/documents")
       .then((r) => r.json())
-      .then((j) => !j.error && setDocs(j.documents as DocSummary[]))
+      .then((j) => {
+        if (j.error) return;
+        const list = j.documents as DocSummary[];
+        setDocs(list);
+        // Newest document. A call is always scoped to exactly ONE document —
+        // there is no "search everything" option, because two uploads can be
+        // different versions of the same job (same item numbers, different
+        // rates) and searching across both gave "item 5 ka amount" two equally
+        // correct answers, with the agent picking one at random and sounding
+        // certain about it.
+        if (list.length > 0) {
+          setScope(list[0].id); // API returns newest first
+          scopeRef.current = list[0].id;
+        }
+      })
       .catch(() => {});
     return () => hangUp();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -193,6 +230,12 @@ export default function CallPage() {
     }
   }
 
+  /** Idempotent: connected, failed and hung-up all land here. */
+  function stopRingtone() {
+    ringtoneStopRef.current?.();
+    ringtoneStopRef.current = null;
+  }
+
   function noteCallerActivity() {
     idleStageRef.current = 0;
     clearIdleTimer();
@@ -220,7 +263,7 @@ export default function CallPage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         query: partial,
-        document_id: scopeRef.current === "all" ? null : scopeRef.current,
+        document_id: scopeRef.current || null,
       }),
     })
       .then((r) => r.json())
@@ -300,8 +343,9 @@ export default function CallPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: utterance,
+          call_id: callIdRef.current,
           history: historyRef.current.slice(0, -1),
-          document_id: scopeRef.current === "all" ? null : scopeRef.current,
+          document_id: scopeRef.current || null,
           // Retrieval primed during the caller's speech; the server validates
           // that the final utterance still matches before using it.
           prefetched: prime.results ? { for: prime.for, results: prime.results } : null,
@@ -441,6 +485,14 @@ export default function CallPage() {
    * for an eager draft, from commitDraft — never from an unconfirmed guess.
    */
   async function finalizeAnswer(gen: number, cleaned: string, sawEnd: boolean) {
+    // Idempotence guard: one generation surfaces at most ONE answer, no matter
+    // which path gets here (stream end, commitDraft, or any interleaving of the
+    // two). This is the structural fix for the answer appearing twice — even a
+    // race not covered by the committed/done flags cannot double-log, double-
+    // speak, or double-append history past this line.
+    if (finalizedGenRef.current === gen) return;
+    finalizedGenRef.current = gen;
+
     historyRef.current = [...historyRef.current, { role: "assistant", content: cleaned }];
     note("agent", cleaned);
     if (sawEnd) {
@@ -547,13 +599,37 @@ export default function CallPage() {
     setLog([]);
     historyRef.current = [];
     draftRef.current = null;
+    // genRef is never reset, so a fresh call's generations keep climbing past
+    // any already-finalized value — but reset the guard anyway so the invariant
+    // ("one finalize per gen") never depends on that detail.
+    finalizedGenRef.current = -1;
     intentionalCloseRef.current = false;
+    callIdRef.current =
+      globalThis.crypto?.randomUUID?.() ?? `call-${Date.now()}-${Math.random()}`;
     queueRef.current = new SpeechQueue(handleSpeaking, handleTtsIssue);
+    // Ringback while we set up. Started here, inside the click handler, so the
+    // browser's autoplay policy allows the AudioContext to run.
+    stopRingtone();
+    ringtoneStopRef.current = startConnectingTone();
 
     // Fire-and-forget: open the server's TLS pools to OpenAI/Supabase/Sarvam
-    // now, so turn 1 of the call is as fast as turn 5.
-    void fetch("/api/warmup", { method: "POST" }).catch(() => {});
+    // and prime the LLM's prompt cache for THIS call's document, so turn 1 is as
+    // fast as turn 5. Passing the scope is what makes the primed prefix match
+    // the first real turn in full mode (priming all-docs was a cache miss).
+    const warmed = fetch("/api/warmup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ document_id: scopeRef.current || null }),
+    }).catch(() => {});
     primeRef.current = { for: "", results: null, inflight: false, lastFiredAt: 0 };
+
+    // The greeting is FIXED and known right now, so start synthesizing it
+    // immediately. Mic permission, the token grant and the WebSocket handshake
+    // all still have to happen — hundreds of ms during which the TTS request
+    // would otherwise sit unstarted. Sequenced after the warm-up call so the
+    // server's Sarvam pool is opening at the same time rather than after.
+    const greeting = "नमस्ते! मैं आपका document देख रही हूँ। बताइए।";
+    void warmed.then(() => queueRef.current?.prewarm(greeting, GREETING_LANG));
 
     try {
       // 0. Re-validate the scope against the CURRENT document list — the page
@@ -563,9 +639,14 @@ export default function CallPage() {
         if (!fresh.error) {
           const list = fresh.documents as DocSummary[];
           setDocs(list);
-          if (scopeRef.current !== "all" && !list.some((x) => x.id === scopeRef.current)) {
-            setScope("all");
-            scopeRef.current = "all";
+          // The selected document may have been deleted or re-ingested under a
+          // new id while this page sat open. Fall back to the newest one —
+          // never to "search everything", which is what mixed two versions of
+          // the same job together and made one question have two right answers.
+          if (!list.some((x) => x.id === scopeRef.current)) {
+            const next = list[0]?.id ?? "";
+            setScope(next);
+            scopeRef.current = next;
           }
         }
       } catch {
@@ -674,18 +755,18 @@ export default function CallPage() {
       // No KeepAlive needed: mic frames flow continuously for the whole call,
       // including while muted (the track is disabled, not detached).
 
+      // Connected — silence the ringback before the greeting speaks.
+      stopRingtone();
       setStatus("live");
       statusRef.current = "live";
       callStartRef.current = Date.now();
       idleStageRef.current = 0;
 
-      // 5. Agent speaks first.
-      const greeting =
-        scopeRef.current === "all"
-          ? `नमस्ते! मैं account desk से बोल रही हूँ। आपके ${docs.length} documents मेरे पास हैं। बताइए।`
-          : "नमस्ते! मैं आपका document देख रही हूँ। बताइए।";
+      // 5. Agent speaks first. Already synthesized during setup (see the
+      //    prewarm at the top of startCall) — push() picks up the buffered
+      //    audio, so this plays immediately instead of paying a round trip.
       note("agent", greeting);
-      queueRef.current.push(greeting);
+      queueRef.current.push(greeting, GREETING_LANG);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setStatus("error");
@@ -713,6 +794,18 @@ export default function CallPage() {
     idleStageRef.current = 0;
     queueRef.current = null;
 
+    stopRingtone();
+    // Free the server's copy of this call's messages. Fire-and-forget: the log
+    // also expires on its own, so a failed beacon costs nothing.
+    if (callIdRef.current) {
+      navigator.sendBeacon?.(
+        "/api/chat/end",
+        new Blob([JSON.stringify({ call_id: callIdRef.current })], {
+          type: "application/json",
+        })
+      );
+      callIdRef.current = "";
+    }
     intentionalCloseRef.current = true;
     wsRef.current?.close();
     wsRef.current = null;
@@ -759,20 +852,27 @@ export default function CallPage() {
         </p>
       ) : (
         <label className="block max-w-md text-sm">
-          <span className="text-ink-muted">Scope of the call</span>
+          <span className="text-ink-muted">Answer from</span>
           <select
             value={scope}
             onChange={(e) => setScope(e.target.value)}
             disabled={live || connecting}
             className="mt-1.5 w-full rounded-lg border border-border bg-surface px-3 py-2 text-ink shadow-soft disabled:opacity-50"
           >
-            <option value="all">All documents ({docs.length})</option>
+            {/* Newest first, matching the API ordering, so the top entry is
+                the one the scope defaults to. A call is always scoped to ONE
+                document — no "all documents" option, because two uploads can
+                be versions of the same job and mixing them gives one question
+                two right answers. */}
             {docs.map((d) => (
               <option key={d.id} value={d.id}>
-                {d.title ?? d.file_name}
+                {docLabel(d)}
               </option>
             ))}
           </select>
+          <span className="mt-1.5 block text-xs text-ink-faint">
+            Pi answers only from this document.
+          </span>
         </label>
       )}
 

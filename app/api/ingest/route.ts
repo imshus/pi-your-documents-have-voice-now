@@ -3,6 +3,7 @@ import { extractDocument } from "@/lib/extract";
 import { chunkDocument } from "@/lib/chunk";
 import { embed } from "@/lib/openai";
 import { supabaseAdmin, DOCUMENTS_BUCKET } from "@/lib/supabase";
+import { ensureSchema, isMissingTableError } from "@/lib/ensureSchema";
 import { invalidateCorpus } from "@/lib/corpus";
 import { TEXT_CONVERTIBLE, extractTextFromFile, resolveMimeType } from "@/lib/parseDocument";
 
@@ -11,9 +12,10 @@ export const maxDuration = 300;
 
 /**
  * Deterministic completeness audit: every number the model transcribed in
- * full_text should also appear somewhere in the structured sections. Numbers
- * that don't are still retrievable via the full_text chunks, but the mismatch
- * is surfaced so a sloppy extraction is visible instead of silent.
+ * full_text should also appear in the TABLES. Numbers that don't are still
+ * retrievable via the full_text chunks, but the gap is surfaced so a table that
+ * silently dropped a cell (the MQGHV-clarity loss) is visible at ingest time
+ * instead of only when a caller asks and gets a wrong count.
  */
 function coverageAudit(data: Record<string, unknown>): string | null {
   const { full_text, confidence_notes, summary, ...structured } = data as {
@@ -78,6 +80,9 @@ export async function POST(req: NextRequest) {
   let db;
   try {
     db = supabaseAdmin();
+    // Auto-create the RAG tables on first upload to a fresh/wiped project, so a
+    // folder drop never fails with "Could not find the table 'public.documents'".
+    await ensureSchema();
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : String(err) },
@@ -136,19 +141,31 @@ export async function POST(req: NextRequest) {
         .upload(storagePath, bytes, { contentType: mimeType, upsert: false });
 
       // --- documents row ----------------------------------------------------
-      const { data: row, error: insertError } = await db
+      const insertRow = {
+        file_name: file.name,
+        mime_type: mimeType,
+        storage_path: upload.error ? null : storagePath,
+        doc_type: data.document_type,
+        title: data.title,
+        summary: data.summary,
+        data,
+      };
+      let { data: row, error: insertError } = await db
         .from("documents")
-        .insert({
-          file_name: file.name,
-          mime_type: mimeType,
-          storage_path: upload.error ? null : storagePath,
-          doc_type: data.document_type,
-          title: data.title,
-          summary: data.summary,
-          data,
-        })
+        .insert(insertRow)
         .select("id")
         .single();
+      // The tables can vanish under a long-running process (a project reset mid
+      // upload). If the insert hits PGRST205, re-provision once and retry before
+      // giving up on this file.
+      if (insertError && isMissingTableError(insertError)) {
+        await ensureSchema(true);
+        ({ data: row, error: insertError } = await db
+          .from("documents")
+          .insert(insertRow)
+          .select("id")
+          .single());
+      }
 
       if (insertError || !row) {
         throw new Error(`Insert failed: ${insertError?.message ?? "no row returned"}`);
@@ -187,6 +204,12 @@ export async function POST(req: NextRequest) {
         data,
       });
     } catch (err) {
+      // Surface the real cause in the server log — the per-file error otherwise
+      // only reaches the client JSON, so a 502 in the dev terminal is opaque.
+      console.error(
+        `[ingest] failed: ${file.name} —`,
+        err instanceof Error ? (err.stack ?? err.message) : err
+      );
       // Roll back whatever this file already created, so a failed ingest never
       // leaves an unsearchable row or an orphaned original in the bucket.
       if (createdId) {

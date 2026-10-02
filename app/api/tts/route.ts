@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { speak, TTS_LANGUAGE, TTS_LANGUAGE_EN } from "@/lib/sarvam";
+import { speak, TTS_LANGUAGE, TTS_LANGUAGE_EN, TTS_MIME } from "@/lib/sarvam";
 
 export const runtime = "nodejs";
 
@@ -18,9 +18,9 @@ function streamOut(upstream: Response): Response {
       // Sarvam's stream endpoint labels the body application/octet-stream, which
       // the browser's <audio> element refuses to decode — so the progressive
       // attempt in SpeechQueue.playOne fails and re-fetches via the blob path,
-      // doubling every TTS request. We always request mp3 (output_audio_codec),
-      // so force the correct type and the streaming element plays on first try.
-      "Content-Type": "audio/mpeg",
+      // doubling every TTS request. Declare the type of the codec we actually
+      // requested and the streaming element plays on first try.
+      "Content-Type": TTS_MIME,
       "Cache-Control": "no-store",
     },
   });

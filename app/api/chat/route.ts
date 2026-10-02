@@ -3,7 +3,13 @@ import { chatBackend, ChatUsage } from "@/lib/chat";
 import { askLanguage, replyDirective } from "@/lib/askLanguage";
 import { CORPUS_MODE, buildCorpus } from "@/lib/corpus";
 import { systemWithCorpus } from "@/lib/corpusFormat";
-import { targetRow } from "@/lib/queryText";
+import { targetRow, carriedRow } from "@/lib/queryText";
+import { focusRow, focusTotals, wantsTotals, focusColumn, wantsColumn } from "@/lib/rowFocus";
+import {
+  history as conversationHistory,
+  lastBareUser,
+  commitTurn,
+} from "@/lib/conversation";
 import { retrieve, RetrievalHit } from "@/lib/retrieval";
 import { PERSONA } from "@/lib/persona";
 
@@ -51,7 +57,9 @@ export async function POST(req: NextRequest) {
     history?: Turn[];
     document_id?: string | null;
     prefetched?: { for: string; results: RetrievalHit[] } | null;
+    call_id?: string | null;
   };
+  const callId = typeof body.call_id === "string" ? body.call_id.slice(0, 64) : null;
 
   const message = (body.message ?? "").trim();
   if (!message) {
@@ -60,22 +68,39 @@ export async function POST(req: NextRequest) {
 
   try {
     // ---- retrieve ---------------------------------------------------------
-    // Client-supplied — validate the roles. Spreading this unchecked let a
-    // crafted request inject a `system` turn and override the grounding rules.
-    const history = (body.history ?? [])
-      .filter(
-        (t): t is Turn =>
-          !!t &&
-          (t.role === "user" || t.role === "assistant") &&
-          typeof t.content === "string"
-      )
-      .map((t) => ({ role: t.role, content: t.content.slice(0, 2000) }))
-      .slice(-8);
+    // Prefer the SERVER's record of what was actually sent. The client stores
+    // the caller's bare utterance, but the request carries that utterance PLUS
+    // the context and directives — so replaying the client's copy diverged from
+    // the real prefix at message index 1 and pinned the cache at PERSONA. The
+    // server log is byte-exact, so the prefix genuinely extends each turn.
+    const logged = conversationHistory(callId);
+    const history =
+      logged.length > 0
+        ? logged
+        : // No call id (the text chat) — fall back to the client's history, and
+          // validate the roles: spreading this unchecked let a crafted request
+          // inject a `system` turn and override the grounding rules.
+          (body.history ?? [])
+            .filter(
+              (t): t is Turn =>
+                !!t &&
+                (t.role === "user" || t.role === "assistant") &&
+                typeof t.content === "string"
+            )
+            .map((t) => ({ role: t.role, content: t.content.slice(0, 2000) }))
+            .slice(-8);
 
     // Fold in the previous turn so follow-ups like "aur branch?" still
-    // retrieve against the right document.
-    const lastUser = [...history].reverse().find((t) => t.role === "user");
-    const searchText = lastUser ? `${lastUser.content}\n${message}` : message;
+    // retrieve against the right document — the BARE utterance, never the
+    // composed message. The conversation log's user turns carry the retrieved
+    // chunks and directives for prefix caching, and folding THAT in embedded
+    // ~3k tokens of chunk text per follow-up and dragged the trigram search
+    // arm from ~130ms to ~1.4s (measured live: retrieve=2195ms).
+    const prevUtterance =
+      lastBareUser(callId) ??
+      [...history].reverse().find((t) => t.role === "user")?.content ??
+      null;
+    const searchText = prevUtterance ? `${prevUtterance}\n${message}` : message;
 
     const tRetrieve = Date.now();
     let retrievalSource = "live";
@@ -86,10 +111,15 @@ export async function POST(req: NextRequest) {
     // prefix that caches on every turn of every call.
     let corpusBlock: string | null = null;
 
+    // Chunk-shaped view of whatever the model will see, for focusRow — the
+    // retrieval hits in hybrid mode, the corpus's own chunks in full mode.
+    let rowSource: { section: string | null; content: string }[] = [];
+
     if (CORPUS_MODE === "full") {
       const corpus = await buildCorpus(body.document_id ?? null);
       if (corpus) {
         corpusBlock = corpus.text;
+        rowSource = corpus.chunks;
         retrievalSource = "corpus";
         // No per-turn context: the documents are already in the prefix, and
         // repeating them here would put a copy in the volatile tail too.
@@ -115,16 +145,53 @@ export async function POST(req: NextRequest) {
 
     const retrieveMs = Date.now() - tRetrieve;
 
-    // Table chunks carry 8 rows each, so "the 8th item" arrives as a block of
-    // items 1-8 and the model was picking a neighbouring row's amount —
-    // confidently, and only on some phrasings. The row is deterministic from the
-    // question, so state it rather than letting the model locate it.
-    const row = targetRow(message);
-    const rowDirective = row
-      ? `ROW: the caller is asking about item ${row}. Read the value from the line for item ${row} only — the context contains several item rows and the neighbouring ones are NOT the answer. If no line for item ${row} appears in the context, say it is not in the documents rather than answering from another row.\n\n`
-      : "";
+    // Better than telling the model which row to find: find it here and hand
+    // over the row's values already labelled, so it never has to count 20-odd
+    // pipe-delimited columns (a header where "Pcs"/"Wt"/"Amt" each repeat).
+    // Works in BOTH modes — hybrid reads the retrieval hits, full mode reads
+    // the corpus's own chunks. Falls back to the instruction when the row is
+    // not present in either.
+    // "uska weight?" after "item 5 ka amount?" names no row — carry the
+    // previous turn's row so the follow-up gets the same deterministic focus.
+    const row = targetRow(message) ?? carriedRow(message, lastBareUser(callId));
+    const source = rowSource.length > 0 ? rowSource : chunks;
+    const focused = row ? focusRow(source, row) : null;
+    // Totals questions get the labelled TOTALS block the same way — locating
+    // it is deterministic, so never leave it to retrieval rank or column
+    // counting. Row focus wins when both could apply ("item 5 ka total").
+    const totals = !focused && wantsTotals(message) ? focusTotals(source) : null;
+    // Column-aggregation questions ("diamond kitne type?", "diamond ka rate?")
+    // ask about a whole column across every item — the class that made the
+    // model hallucinate a value. Compute the de-duplicated column and hand it
+    // over. Lowest priority: a specific row or a totals line beats it.
+    const column =
+      !focused && !totals && wantsColumn(message, source)
+        ? focusColumn(source, message)
+        : null;
+    const rowDirective = focused
+      ? `${focused}\n\n`
+      : totals
+        ? `${totals}\n\n`
+        : column
+          ? `${column}\n\n`
+          : row
+            ? `ROW: the caller is asking about item ${row}. Read the value from the line for item ${row} only — the context contains several item rows and the neighbouring ones are NOT the answer. If no line for item ${row} appears in the context, say it is not in the documents rather than answering from another row.\n\n`
+            : "";
 
     // ---- generate ---------------------------------------------------------
+    // Built once and reused for BOTH the request and the conversation log —
+    // the log is only useful if it holds the exact bytes that were sent.
+    const userContent = corpusBlock
+      ? `${message}
+
+${rowDirective}${replyDirective(askLanguage(message))}`
+      : `${message}
+
+CONTEXT (retrieved from the caller's documents):
+${context}
+
+${rowDirective}${replyDirective(askLanguage(message))}`;
+
     const tLlm = Date.now();
     const backend = chatBackend();
     const upstream = await backend.fetch("/chat/completions", {
@@ -135,7 +202,11 @@ export async function POST(req: NextRequest) {
         // Provider-specific tuning (reasoning/verbosity/cache-key vs temperature).
         ...backend.tuning,
         // Short spoken answers; parameter-level backstop for the prompt rule.
-        [backend.capField]: 200,
+        // 200 occasionally clipped a longer reply mid-sentence (an answer that
+        // read back a value plus a unit and a follow-through) — the persona
+        // still keeps replies short, so 400 only prevents truncation, it does
+        // not make answers longer.
+        [backend.capField]: 400,
         // Final usage frame so we can log how much of the input prefix
         // (PERSONA + history) was served from cache vs billed fresh.
         stream_options: { include_usage: true },
@@ -175,6 +246,8 @@ export async function POST(req: NextRequest) {
         let ttft: number | null = null;
         let usage: ChatUsage | null = null;
         let errored = false;
+        // Accumulated so the completed turn can be committed to the log.
+        let answer = "";
 
         try {
           for (;;) {
@@ -219,6 +292,7 @@ export async function POST(req: NextRequest) {
                       `[chat] retrieve=${retrieveMs}ms llm_ttft=${ttft}ms chunks=${chunks.length}`
                     );
                   }
+                  answer += delta;
                   controller.enqueue(encoder.encode(delta));
                 }
               }
@@ -237,8 +311,14 @@ export async function POST(req: NextRequest) {
             const pct = prompt ? Math.round((cached / prompt) * 100) : 0;
             // Cached input = the stable PERSONA + history prefix reused each
             // turn; only the fresh retrieval + new user message is billed full.
-            console.log(`[chat] input=${prompt}tok cached=${cached}tok (${pct}%)`);
+            console.log(
+              `[chat] input=${prompt}tok cached=${cached}tok (${pct}%) turns=${history.length / 2}`
+            );
           }
+          // Commit ONLY a completed turn. An aborted/failed one is left out, so
+          // the next turn still extends the last good prefix (and the cache
+          // still hits) instead of inheriting a half-answer.
+          if (!errored && answer) commitTurn(callId, userContent, answer, message);
           if (!errored) controller.close();
         }
       },

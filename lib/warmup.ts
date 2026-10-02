@@ -1,4 +1,5 @@
 import { embed } from "./openai";
+import { warmSarvam } from "./sarvam";
 import { chatBackend } from "./chat";
 import { CORPUS_MODE, buildCorpus } from "./corpus";
 import { systemWithCorpus } from "./corpusFormat";
@@ -12,19 +13,20 @@ import { PERSONA } from "./persona";
  * latency. The 16-token cap is plenty — we only care that the prefix gets
  * cached, not the output.
  */
-async function primeChatCache(): Promise<void> {
+async function primeChatCache(documentId: string | null): Promise<void> {
   const backend = chatBackend();
 
   // Must be the EXACT system content the chat route will send, or the prefix
-  // differs and this primes nothing. In full mode that means the corpus too —
-  // which is the whole point: the caller's first turn then hits ~14k cached
-  // tokens instead of prefilling them cold.
+  // differs and this primes nothing. In full mode that means the corpus for the
+  // SAME scope the call will use — priming the all-documents prefix while the
+  // call is scoped to one document was a total cache miss, so the first turn
+  // paid full cold prefill (the "slow to start"). Prime the scoped corpus.
   let system = PERSONA;
   if (CORPUS_MODE === "full") {
-    const corpus = await buildCorpus(null).catch(() => null);
+    const corpus = await buildCorpus(documentId).catch(() => null);
     if (corpus) {
       system = systemWithCorpus(PERSONA, corpus.text);
-      console.log(`[warmup] priming corpus prefix: ${corpus.docCount} docs, ~${corpus.tokens} tokens`);
+      console.log(`[warmup] priming corpus prefix: ${corpus.docCount} doc(s), ~${corpus.tokens} tokens`);
     }
   }
 
@@ -48,18 +50,26 @@ async function primeChatCache(): Promise<void> {
  * both cold TLS handshakes AND a cold prompt cache. Safe to call repeatedly;
  * each leg is independent and failures are swallowed by the caller.
  */
-export async function warmUp(): Promise<{ ms: number; warmed: string[] }> {
+export async function warmUp(
+  documentId: string | null = null
+): Promise<{ ms: number; warmed: string[] }> {
   const t0 = Date.now();
   const legs = ["chat", "embed", "supabase", "sarvam"];
   const results = await Promise.allSettled([
-    primeChatCache(), // answering-model chat pool + prompt cache
+    primeChatCache(documentId), // answering-model chat pool + prompt cache
     embed(["hi"]), // OpenAI embeddings pool
-    supabaseAdmin().from("documents").select("id").limit(1),
-    fetch("https://api.sarvam.ai/text-to-speech/stream", { method: "POST" }), // 4xx after TLS — free
+    // Thunked, so a synchronous throw from supabaseAdmin() (missing env) is
+    // captured by allSettled instead of rejecting warmUp() itself.
+    (async () => supabaseAdmin().from("documents").select("id").limit(1))(),
+    warmSarvam(), // the TTS pool specifically — see lib/sarvam.ts
   ]);
-  return {
-    ms: Date.now() - t0,
-    // sarvam intentionally 4xx's (invalid body) but the TLS handshake still warms.
-    warmed: legs.filter((_, i) => results[i].status === "fulfilled" || i === 3),
-  };
+
+  // Report per leg instead of guessing. A silently-failing warm-up leg just
+  // moves its latency into the caller's first turn, so it should be visible.
+  const warmed: string[] = [];
+  results.forEach((r, i) => {
+    if (r.status === "fulfilled") warmed.push(legs[i]);
+    else console.error(`[warmup] ${legs[i]} failed:`, r.reason);
+  });
+  return { ms: Date.now() - t0, warmed };
 }

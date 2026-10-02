@@ -39,6 +39,15 @@ export const TTS_MODEL = process.env.SARVAM_MODEL ?? "bulbul:v3";
  */
 export const TTS_SPEAKER = process.env.SARVAM_SPEAKER ?? "priya";
 /**
+ * wav by default: lossless, and unlike mp3 it carries no encoder delay/padding
+ * baked into each per-sentence clip, so consecutive clips join without the
+ * tiny seams of silence mp3 framing creates. mp3 remains available for
+ * bandwidth-constrained deployments.
+ */
+export const TTS_CODEC = process.env.SARVAM_CODEC === "mp3" ? "mp3" : "wav";
+/** The Content-Type the proxy route must declare for the chosen codec. */
+export const TTS_MIME = TTS_CODEC === "mp3" ? "audio/mpeg" : "audio/wav";
+/**
  * target_language_code drives how numbers and abbreviations are SPOKEN.
  * It is chosen per sentence: text containing Devanagari (a Hinglish reply)
  * speaks numbers in Hindi; a pure-Latin sentence (an English reply) speaks
@@ -99,6 +108,28 @@ export function normalizeForSpeech(text: string): string {
 }
 
 /**
+ * Opens (and drains) one connection on the SAME pool `speak` uses, so the first
+ * real synthesis skips the TCP+TLS handshake.
+ *
+ * This must go through `sarvamAgent`. The previous warm-up called the GLOBAL
+ * fetch, which uses undici's global dispatcher — a different pool entirely — so
+ * it warmed a connection the TTS path never touched, and the first clip of
+ * every call still paid a cold handshake (measured: 44ms TCP + 83ms TLS to
+ * api.sarvam.ai). It also never drained the body, so the socket was never
+ * returned to the pool.
+ *
+ * The empty POST 4xx's before any synthesis runs, so it costs no credits.
+ */
+export async function warmSarvam(): Promise<void> {
+  const res = await undiciFetch(`${SARVAM_API}/text-to-speech/stream`, {
+    dispatcher: sarvamAgent,
+    method: "POST",
+    headers: { "api-subscription-key": process.env.SARVAM_API_KEY ?? "" },
+  });
+  await res.text(); // drain so the socket returns to the keep-alive pool
+}
+
+/**
  * Returns the upstream streaming response; caller pipes the body through.
  * `langOverride` (hi-IN | en-IN) forces the number/abbreviation language — the
  * call site passes the CALLER'S ask language so numbers are spoken in the
@@ -124,7 +155,7 @@ export async function speak(text: string, langOverride?: string): Promise<Respon
       target_language_code: langOverride ?? languageFor(clean),
       speaker: TTS_SPEAKER,
       model: TTS_MODEL,
-      output_audio_codec: "mp3",
+      output_audio_codec: TTS_CODEC,
       speech_sample_rate: SAMPLE_RATE,
       pace: Number(process.env.SARVAM_PACE ?? 1.0),
       // Randomness control (v3 only, 0.01-1.0, default 0.6). Every sentence is
@@ -133,7 +164,14 @@ export async function speak(text: string, langOverride?: string): Promise<Respon
       // in Sarvam's documented "flat, highly consistent" band (0.01-0.2), which
       // is what keeps one reply sounding like one voice.
       // (enable_preprocessing is v2-only and does not apply to v3.)
-      temperature: Number(process.env.SARVAM_TEMPERATURE ?? 0.2),
+      // 0.01 = the floor of the documented "flat, highly consistent" band.
+      // Each sentence is a separate stateless request with NO seed parameter
+      // (none exists on this API), so any temperature above the floor re-rolls
+      // prosody per clip — the "voice keeps changing" symptom. The floor keeps
+      // one reply sounding like one voice, and Sarvam has no style-adaptation
+      // features: nothing anywhere in this pipeline varies the voice with the
+      // caller's pitch or tone.
+      temperature: Number(process.env.SARVAM_TEMPERATURE ?? 0.01),
     }),
   });
 
